@@ -1,3 +1,7 @@
+import { makeAnalysisPrompts, makeSynthesisPrompt } from '../../lib/ai/analysis';
+import type { AiAnalysis, AiAnalysisType, AiProvider } from '../../lib/ai/analysis';
+import { nativeRequest } from '../../lib/ai/native';
+import { getAnalysesForRun, saveAnalysis } from '../../lib/db';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { formatLocalDateTime } from '../../lib/dates/parse';
 import {
@@ -50,6 +54,16 @@ export default function App() {
   const [onlyMedia, setOnlyMedia] = useState(false);
   const [visibleCount, setVisibleCount] = useState(200);
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle');
+  const [aiProvider, setAiProvider] = useState<AiProvider>('chatgpt_codex');
+  const [aiType, setAiType] = useState<AiAnalysisType>('themes');
+  const [aiPrompt, setAiPrompt] = useState('');
+  const [aiModel, setAiModel] = useState('');
+  const [aiHistory, setAiHistory] = useState<AiAnalysis[]>([]);
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiProgress, setAiProgress] = useState('');
+  const [aiError, setAiError] = useState('');
+  const [aiConnection, setAiConnection] = useState('');
+  const [aiResult, setAiResult] = useState<AiAnalysis | null>(null);
 
   const load = useCallback(
     async (silent = false) => {
@@ -166,6 +180,78 @@ export default function App() {
     } catch (copyError) {
       setCopyState('error');
       setNotice({ tone: 'error', text: `No se pudo copiar: ${getErrorMessage(copyError)}` });
+    }
+  };
+
+  const loadAiHistory = useCallback(async () => {
+    if (!runId) return;
+    try { setAiHistory(await getAnalysesForRun(runId)); }
+    catch (error) { setAiError(getErrorMessage(error)); }
+  }, [runId]);
+
+  useEffect(() => { void loadAiHistory(); }, [loadAiHistory]);
+
+  const checkAiConnection = async () => {
+    setAiError('');
+    setAiConnection('Comprobando el puente local…');
+    try {
+      const response = await nativeRequest({ type: 'PING' });
+      const status = response.providers?.[aiProvider];
+      setAiConnection(status?.installed
+        ? 'CLI instalado y accesible. La sesión se comprobará al analizar.'
+        : 'Puente conectado, pero no se detectó el CLI seleccionado.');
+    } catch (error) {
+      setAiConnection('');
+      setAiError(getErrorMessage(error));
+    }
+  };
+
+  const analyzeWithAi = async () => {
+    if (!data || aiBusy || !data.posts.length) return;
+    setAiBusy(true);
+    setAiError('');
+    setAiProgress('Preparando los tweets…');
+    try {
+      const built = makeAnalysisPrompts(data.posts, aiType, aiPrompt);
+      if (!built.prompts.length) throw new Error('No hay tweets para analizar.');
+      const partials: string[] = [];
+      for (let index = 0; index < built.prompts.length; index++) {
+        setAiProgress('Analizando lote ' + (index + 1) + ' de ' + built.prompts.length + '…');
+        const response = await nativeRequest({
+          type: 'ANALYZE',
+          provider: aiProvider,
+          model: aiModel.trim(),
+          prompt: built.prompts[index],
+        });
+        if (!response.text) throw new Error('El proveedor no devolvió un resultado.');
+        partials.push(response.text);
+      }
+      let result = partials[0]!;
+      if (partials.length > 1) {
+        setAiProgress('Consolidando los análisis parciales…');
+        const consolidated = await nativeRequest({
+          type: 'ANALYZE', provider: aiProvider, model: aiModel.trim(),
+          prompt: makeSynthesisPrompt(partials, aiType),
+        });
+        if (!consolidated.text) throw new Error('No se pudo consolidar el análisis.');
+        result = consolidated.text;
+      }
+      const analysis: AiAnalysis = {
+        id: crypto.randomUUID(), runId, createdAt: new Date().toISOString(),
+        provider: aiProvider, model: aiModel.trim(), kind: aiType,
+        prompt: aiType === 'custom' ? aiPrompt.trim() : '',
+        result, processedPosts: built.processed, skippedPosts: built.skipped,
+        chunkCount: built.prompts.length,
+      };
+      await saveAnalysis(analysis);
+      setAiResult(analysis);
+      await loadAiHistory();
+      setAiProgress('Análisis guardado.');
+    } catch (error) {
+      setAiError(getErrorMessage(error));
+      setAiProgress('');
+    } finally {
+      setAiBusy(false);
     }
   };
 
@@ -350,6 +436,99 @@ export default function App() {
             recolectado, no el filtro de esta vista. El digest está pensado para pegarse en un chat
             de IA.
           </p>
+        </section>
+
+        <section className="card" aria-label="Análisis con inteligencia artificial">
+          <div className="card-heading">
+            <div>
+              <span className="eyebrow">Inteligencia artificial · Puente local</span>
+              <h2>Analizar con IA</h2>
+            </div>
+          </div>
+          <p className="hint">
+            Usa una sesión de Codex CLI (ChatGPT) u OpenCode CLI ya autorizada en Windows.
+            Los tweets se envían al modelo elegido. Esta etapa utiliza CLI, no OAuth directo.
+          </p>
+          <div className="form-grid" style={{ display: 'grid', gap: 12, marginTop: 14, marginBottom: 14 }}>
+            <label>
+              Proveedor
+              <select value={aiProvider} disabled={aiBusy}
+                onChange={event => { setAiProvider(event.target.value as AiProvider); setAiConnection(''); }}>
+                <option value="chatgpt_codex">ChatGPT (Codex CLI)</option>
+                <option value="opencode">OpenCode CLI</option>
+              </select>
+            </label>
+            <label>
+              Modelo (opcional: vacío usa el predeterminado del CLI)
+              <input value={aiModel} disabled={aiBusy} placeholder="Modelo predeterminado"
+                onChange={event => setAiModel(event.target.value)} />
+            </label>
+            <label>
+              Tipo de análisis
+              <select value={aiType} disabled={aiBusy}
+                onChange={event => setAiType(event.target.value as AiAnalysisType)}>
+                <option value="themes">Resumen temático</option>
+                <option value="highlights">Publicaciones importantes</option>
+                <option value="trends">Tendencias y novedades</option>
+                <option value="custom">Instrucciones propias</option>
+              </select>
+            </label>
+            {aiType === 'custom' && (
+              <label>
+                Instrucciones para el análisis
+                <textarea value={aiPrompt} disabled={aiBusy} rows={4}
+                  onChange={event => setAiPrompt(event.target.value)}
+                  placeholder="Describe qué quieres identificar en las publicaciones" />
+              </label>
+            )}
+          </div>
+          <div className="button-row" style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+            <button className="btn btn-secondary" disabled={aiBusy} onClick={() => void checkAiConnection()}>
+              Comprobar conexión
+            </button>
+            <button className="btn btn-primary" disabled={aiBusy || !data.posts.length}
+              onClick={() => void analyzeWithAi()}>
+              {aiBusy ? 'Analizando…' : 'Analizar publicaciones'}
+            </button>
+          </div>
+          {aiConnection && <p className="hint" role="status">{aiConnection}</p>}
+          {aiProgress && <p className="hint" role="status">{aiProgress}</p>}
+          {aiError && <p className="field-error" role="alert">{aiError}</p>}
+          {(aiResult || aiHistory.length > 0) && (
+            <div style={{ marginTop: 16 }}>
+              <h3>Informes guardados</h3>
+              <select aria-label="Seleccionar informe" value={aiResult?.id ?? ''}
+                onChange={event => setAiResult(aiHistory.find(item => item.id === event.target.value) ?? null)}>
+                <option value="">Selecciona un informe anterior</option>
+                {aiHistory.map(item => (
+                  <option key={item.id} value={item.id}>
+                    {new Date(item.createdAt).toLocaleString('es')} · {item.provider} · {item.kind}
+                  </option>
+                ))}
+              </select>
+              {aiResult && (
+                <div>
+                  <p className="hint">
+                    {aiResult.processedPosts} posts analizados · {aiResult.skippedPosts} omitidos
+                    · {aiResult.chunkCount} lotes
+                  </p>
+                  {aiResult.skippedPosts > 0 && (
+                    <p className="field-error">La cantidad excedió el límite de esta versión.
+                      El informe no incluye todos los posts.</p>
+                  )}
+                  <div className="button-row">
+                    <button className="btn btn-secondary" onClick={() =>
+                      downloadTextFile('xense-analisis-' + aiResult.id + '.md', aiResult.result, 'text/markdown')}>
+                      Descargar Markdown
+                    </button>
+                  </div>
+                  <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', marginTop: 12 }}>
+                    {aiResult.result}
+                  </pre>
+                </div>
+              )}
+            </div>
+          )}
         </section>
 
         <div className="dash-columns">
