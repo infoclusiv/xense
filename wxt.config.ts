@@ -7,7 +7,7 @@ export default defineConfig({
     description: 'Recolecta y exporta los posts de tus listas de X por rango de fechas.',
     version: '0.1.0',
     minimum_chrome_version: '116',
-    permissions: ['storage', 'unlimitedStorage'],
+    permissions: ['storage', 'unlimitedStorage', 'nativeMessaging'],
     host_permissions: ['https://x.com/*', 'https://twitter.com/*'],
     action: {
       default_title: 'Xense',

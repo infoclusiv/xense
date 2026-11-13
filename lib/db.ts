@@ -1,7 +1,13 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
+import type { AiAnalysis } from './ai/analysis';
 import type { ListInfo, NormalizedPost, RunRecord, StoredPost } from './types';
 
 interface XenseDB extends DBSchema {
+  analyses: {
+    key: string;
+    value: AiAnalysis;
+    indexes: { 'by-run': string };
+  };
   lists: {
     key: string;
     value: ListInfo;
@@ -23,8 +29,13 @@ let dbPromise: Promise<IDBPDatabase<XenseDB>> | null = null;
 
 export function getDB(): Promise<IDBPDatabase<XenseDB>> {
   if (!dbPromise) {
-    dbPromise = openDB<XenseDB>('xense-db', 1, {
-      upgrade(db) {
+    dbPromise = openDB<XenseDB>('xense-db', 2, {
+      upgrade(db, oldVersion) {
+        if (oldVersion < 2) {
+          const analyses = db.createObjectStore('analyses', { keyPath: 'id' });
+          analyses.createIndex('by-run', 'runId');
+        }
+        if (oldVersion >= 1) return;
         const lists = db.createObjectStore('lists', { keyPath: 'id' });
         lists.createIndex('by-name', 'name');
         const runs = db.createObjectStore('runs', { keyPath: 'id' });
@@ -159,9 +170,20 @@ export async function getNewestPostForRun(runId: string): Promise<StoredPost | u
   return cursor?.value;
 }
 
+export async function saveAnalysis(analysis: AiAnalysis): Promise<void> {
+  const db = await getDB();
+  await db.put('analyses', analysis);
+}
+
+export async function getAnalysesForRun(runId: string): Promise<AiAnalysis[]> {
+  const db = await getDB();
+  const items = await db.getAllFromIndex('analyses', 'by-run', runId);
+  return items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
 export async function deleteRun(runId: string): Promise<void> {
   const db = await getDB();
-  const tx = db.transaction(['runs', 'posts'], 'readwrite');
+  const tx = db.transaction(['runs', 'posts', 'analyses'], 'readwrite');
   await tx.objectStore('runs').delete(runId);
   const postsStore = tx.objectStore('posts');
   const index = postsStore.index('by-run');
@@ -170,16 +192,23 @@ export async function deleteRun(runId: string): Promise<void> {
     await cursor.delete();
     cursor = await cursor.continue();
   }
+  const analysisCursorStore = tx.objectStore('analyses');
+  let analysisCursor = await analysisCursorStore.index('by-run').openCursor(IDBKeyRange.only(runId));
+  while (analysisCursor) {
+    await analysisCursor.delete();
+    analysisCursor = await analysisCursor.continue();
+  }
   await tx.done;
 }
 
 export async function clearAllData(): Promise<void> {
   const db = await getDB();
-  const tx = db.transaction(['lists', 'runs', 'posts'], 'readwrite');
+  const tx = db.transaction(['lists', 'runs', 'posts', 'analyses'], 'readwrite');
   await Promise.all([
     tx.objectStore('lists').clear(),
     tx.objectStore('runs').clear(),
     tx.objectStore('posts').clear(),
+    tx.objectStore('analyses').clear(),
   ]);
   await tx.done;
 }
