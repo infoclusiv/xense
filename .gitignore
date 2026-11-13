@@ -1,0 +1,10 @@
+node_modules/
+.wxt/
+.output/
+dist/
+coverage/
+*.zip
+.env
+.env.*
+.DS_Store
+Thumbs.db
