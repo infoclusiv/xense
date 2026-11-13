@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const MAX_MESSAGE = 1024 * 1024;
+// The Windows launcher can select a specific Codex binary without changing global PATH.
+const CODEX_BINARY = process.env.XENSE_CODEX_PATH || 'codex';
 function send(data) {
   const bytes = Buffer.from(JSON.stringify(data));
   const prefix = Buffer.alloc(4);
@@ -62,9 +64,11 @@ function execute(binary, args, options = {}) {
     child.stdin.end(options.input ?? '');
   });
 }
-async function isInstalled(binary) {
-  try { await execute(binary, ['--version'], { timeout: 10000 }); return true; }
-  catch { return false; }
+async function inspectCli(binary) {
+  try {
+    const version = await execute(binary, ['--version'], { timeout: 10000 });
+    return { installed: true, version: version.trim().split(/\r?\n/)[0].slice(0, 100) };
+  } catch { return { installed: false }; }
 }
 async function analyze(request) {
   if (!['chatgpt_codex', 'opencode'].includes(request.provider)) throw new Error('Proveedor no admitido.');
@@ -81,7 +85,7 @@ async function analyze(request) {
       const args = ['exec', '--skip-git-repo-check', '--sandbox', 'read-only', '--output-last-message', output];
       if (model) args.push('--model', model);
       args.push('-');
-      await execute('codex', args, { cwd: folder, input: request.prompt });
+      await execute(CODEX_BINARY, args, { cwd: folder, input: request.prompt });
       answer = await readFile(output, 'utf8');
     } else {
       const source = join(folder, 'tweets.txt');
@@ -113,12 +117,12 @@ async function analyze(request) {
 }
 async function handle(request) {
   if (request?.type === 'PING') {
-    const [codex, opencode] = await Promise.all([isInstalled('codex'), isInstalled('opencode')]);
+    const [codex, opencode] = await Promise.all([inspectCli(CODEX_BINARY), inspectCli('opencode')]);
     return {
       ok: true, version: '0.1.0',
       providers: {
-        chatgpt_codex: { installed: codex, label: 'ChatGPT mediante Codex CLI' },
-        opencode: { installed: opencode, label: 'OpenCode CLI' },
+        chatgpt_codex: { ...codex, label: 'ChatGPT mediante Codex CLI' },
+        opencode: { ...opencode, label: 'OpenCode CLI' },
       },
     };
   }

@@ -2,6 +2,7 @@ param(
   [Parameter(Mandatory = $true)]
   [ValidatePattern('^[a-p]{32}$')]
   [string]$ExtensionId,
+  [string]$CodexPath,
   [switch]$Edge
 )
 $ErrorActionPreference = 'Stop'
@@ -12,7 +13,19 @@ if (-not (Test-Path $script)) { throw 'No se encontró companion/host.mjs.' }
 
 # Chrome on Windows can launch the host via a .cmd wrapper.
 $launcher = Join-Path $folder 'xense-native.cmd'
-$lines = @('@echo off', ('"{0}" "{1}"' -f $node, $script))
+$lines = @('@echo off')
+if ($CodexPath) {
+  $resolvedCodex = (Resolve-Path -LiteralPath $CodexPath -ErrorAction Stop).ProviderPath
+  if (-not (Test-Path -LiteralPath $resolvedCodex -PathType Leaf)) {
+    throw 'El ejecutable de Codex seleccionado no existe.'
+  }
+  # The resolved path is inserted into a batch launcher; reject CMD metacharacters.
+  if ($resolvedCodex -match '["%&|<>!^\r\n]') {
+    throw 'La ruta del CLI contiene caracteres incompatibles con el lanzador de Windows.'
+  }
+  $lines += ('set "XENSE_CODEX_PATH={0}"' -f $resolvedCodex)
+}
+$lines += ('"{0}" "{1}"' -f $node, $script)
 [IO.File]::WriteAllLines($launcher, $lines, [Text.Encoding]::ASCII)
 
 $manifest = Join-Path $folder 'com.infoclusiv.xense.json'
@@ -32,4 +45,5 @@ Set-Item -Path $key -Value $manifest
 Write-Host 'XENSE_NATIVE_HOST_REGISTERED' -ForegroundColor Green
 Write-Host "Host: $manifest"
 Write-Host "Extension ID: $ExtensionId"
+if ($CodexPath) { Write-Host "Codex seleccionado: $resolvedCodex" }
 Write-Host 'Reabre Xense y pulsa Comprobar conexión.'

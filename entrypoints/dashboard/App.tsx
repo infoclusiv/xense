@@ -198,7 +198,7 @@ export default function App() {
       const response = await nativeRequest({ type: 'PING' });
       const status = response.providers?.[aiProvider];
       setAiConnection(status?.installed
-        ? 'CLI instalado y accesible. La sesión se comprobará al analizar.'
+        ? (status?.version ? status.version + ' · CLI accesible. La sesión se comprobará al analizar.' : 'CLI instalado y accesible. La sesión se comprobará al analizar.')
         : 'Puente conectado, pero no se detectó el CLI seleccionado.');
     } catch (error) {
       setAiConnection('');

@@ -11,7 +11,13 @@ Primera fase: la extensión se conecta a un proceso Node.js local mediante **Chr
 
        .\companion\install-windows.ps1 -ExtensionId "ID_REAL_DE_LA_EXTENSION"
 
-   Agrega -Edge si usas Edge. No requiere permisos de administrador: registra el host solo en HKCU.
+   Si PowerShell encuentra una versión antigua de Codex desde pnpm, selecciona exclusivamente para Xense la versión instalada con npm:
+
+       $codexNuevo = Join-Path (npm prefix -g) "codex.cmd"
+       & $codexNuevo --version
+       .\companion\install-windows.ps1 -ExtensionId "ID_REAL_DE_LA_EXTENSION" -CodexPath $codexNuevo
+
+   Este parámetro guarda la ruta explícita dentro del lanzador local de Xense. **No cambia el PATH del sistema ni actualiza o desinstala otras versiones de Codex.** Agrega -Edge si usas Edge. No requiere permisos de administrador: registra el host solo en HKCU.
 5. Cierra y abre el dashboard y comprueba la conexión desde «Análisis con IA».
 
 El botón de comprobación solo verifica si se puede invocar el CLI; no prueba si el usuario conserva sesiones activas o cuotas. El análisis real realiza la prueba completa.

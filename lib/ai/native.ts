@@ -7,7 +7,7 @@ export interface NativeReply {
   error?: string;
   text?: string;
   version?: string;
-  providers?: Record<AiProvider, { installed: boolean; label: string }>;
+  providers?: Record<AiProvider, { installed: boolean; label: string; version?: string }>;
 }
 
 export async function nativeRequest(message: Record<string, unknown>): Promise<NativeReply> {
