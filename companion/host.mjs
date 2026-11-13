@@ -12,6 +12,24 @@ function send(data) {
   prefix.writeUInt32LE(bytes.length);
   process.stdout.write(Buffer.concat([prefix, bytes]));
 }
+// Never return raw CLI logs to Chrome: stderr can include tweets, paths or credentials.
+function classifyFailure(raw) {
+  const log = raw.toLowerCase();
+  if (/(not logged in|login required|authentication required|sign in|unauthorized|invalid api key|401\b)/i.test(log))
+    return 'Parece un problema de autenticación. Ejecuta: codex login status';
+  if (/(rate.limit|quota|usage.limit|429\b|too many requests)/i.test(log))
+    return 'El proveedor parece haber alcanzado un límite de uso. Revisa el estado de tu plan.';
+  if (/(sandbox|helper_unknown_error|setup refresh|createprocessasuserw|access is denied|permission denied)/i.test(log))
+    return 'Codex podría tener un problema con el sandbox de Windows. Reproduce la prueba directamente en PowerShell.';
+  if (/(unknown (argument|option)|unrecognized (argument|option)|unexpected argument|found argument)/i.test(log))
+    return 'La versión del CLI podría no admitir estos argumentos. Ejecuta: codex exec --help';
+  if (/(unknown model|model not found|model does not exist|unsupported model)/i.test(log))
+    return 'El modelo configurado no parece estar disponible. Prueba dejando el campo Modelo vacío.';
+  if (/(network|connection refused|could not resolve|connection reset|timed out|tls error)/i.test(log))
+    return 'Parece un fallo de conectividad con el proveedor.';
+  return 'Causa no identificada. Ejecuta una prueba de codex exec en PowerShell para obtener el diagnóstico.';
+}
+
 function execute(binary, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(binary, args, {
@@ -31,13 +49,13 @@ function execute(binary, args, options = {}) {
       if (bytes > MAX_MESSAGE) child.kill();
       else chunks.push(b);
     });
-    child.stderr.on('data', b => { errors = (errors + b.toString('utf8')).slice(-600); });
+    child.stderr.on('data', b => { errors = (errors + b.toString('utf8')).slice(-8000); });
     child.on('error', e => { clearTimeout(timeout); reject(e); });
     child.on('close', code => {
       clearTimeout(timeout);
       if (expired) return reject(new Error('Tiempo de ejecución agotado.'));
       if (bytes > MAX_MESSAGE) return reject(new Error('La respuesta superó el límite de tamaño.'));
-      if (code !== 0) return reject(new Error('El CLI falló (código ' + code + '). Revisa la autenticación y los límites del proveedor.'));
+      if (code !== 0) return reject(new Error('El CLI falló (código ' + code + '). ' + classifyFailure(errors + '\n' + Buffer.concat(chunks).toString('utf8').slice(-3000))));
       resolve(Buffer.concat(chunks).toString('utf8'));
     });
     child.stdin.on('error', () => {});
