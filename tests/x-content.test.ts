@@ -123,6 +123,37 @@ afterEach(() => {
 });
 
 describe('observación de solicitudes en X', () => {
+  it('reenvía el detalle de un post solo en una pestaña usada para recuperar contexto', async () => {
+    vi.resetModules();
+    const postMessage = vi.fn();
+    const response = Promise.resolve({
+      status: 200, ok: true,
+      clone: () => ({ json: async () => ({ data: { tweetResult: { result: {
+        rest_id: '100',
+        legacy: {
+          created_at: 'Thu Nov 12 14:30:00 +0000 2026',
+          full_text: 'Una respuesta',
+          in_reply_to_status_id_str: '99',
+        },
+      } } } }) }),
+    });
+    const page = { fetch: vi.fn().mockReturnValue(response), postMessage };
+    vi.stubGlobal('window', page);
+    vi.stubGlobal('location', new URL('https://x.com/i/status/100#xense-context'));
+    vi.stubGlobal('XMLHttpRequest', class { open() {} });
+    vi.stubGlobal('defineContentScript', (definition: { main: () => void }) => {
+      definition.main();
+      return definition;
+    });
+    await import('../entrypoints/x-main.content');
+    await page.fetch('/i/api/graphql/example/TweetResultByRestId');
+    await vi.waitFor(() => expect(postMessage).toHaveBeenCalledWith({
+      source: 'xense-page',
+      kind: 'detail',
+      posts: [expect.objectContaining({ id: '100', replyToPostId: '99' })],
+    }, 'https://x.com'));
+  });
+
   it('pasa las escrituras al sitio una sola vez y observa el límite de la lectura del timeline', async () => {
     vi.resetModules();
     const postMessage = vi.fn();

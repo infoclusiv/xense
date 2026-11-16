@@ -1,6 +1,8 @@
 import type { Ref } from 'react';
 import type { AiAnalysis } from '../../lib/ai/analysis';
 import type { Infographic } from '../../lib/ai/infographic';
+import { contextCoverageText } from '../../lib/ai/evidence';
+import { transcriptLink, transcriptTime } from '../../lib/ai/transcript';
 import type { PostType } from '../../lib/types';
 import { shortRunDate } from '../../lib/ui/api';
 import '../../assets/infographic.css';
@@ -23,6 +25,7 @@ export default function InfographicView({ report, analysis, articleRef }: Props)
   const { collection } = report;
   const activityPeak = Math.max(1, ...collection.activity.map(item => item.count));
   const provider = analysis.provider === 'chatgpt_codex' ? 'Codex CLI' : 'OpenCode CLI';
+  const contextSummary = contextCoverageText(analysis.contextCoverage);
 
   return (
     <article className="infographic" aria-labelledby="infographic-title" ref={articleRef}>
@@ -50,12 +53,38 @@ export default function InfographicView({ report, analysis, articleRef }: Props)
                 <p>{finding.detail}</p>
                 <div className="ig-sources">
                   {finding.sources.map(source => (
-                    <a key={source.id} href={source.url} target="_blank" rel="noopener noreferrer"
-                      aria-label={`Ver publicación ${source.id} de @${source.handle} en X`}>
-                      @{source.handle} · {shortRunDate(source.createdAt, collection.timezone)} <span aria-hidden="true">↗</span>
+                    <a key={source.id} href={source.url} target="_blank" rel="noopener noreferrer">
+                      {source.title ?? `@${source.handle}`}
+                      {source.method ? ` · ${source.method}` : source.createdAt && ` · ${shortRunDate(source.createdAt, collection.timezone)}`}
+                      {' '}<span aria-hidden="true">↗</span>
                     </a>
                   ))}
                 </div>
+                {finding.sources.map(source => source.moments?.length ? (
+                  <details className="ig-frames" key={source.id}>
+                    <summary>Fotogramas · {source.title ?? 'Video o GIF'}</summary>
+                    <ul>
+                      {source.moments.map((moment, index) => (
+                        <li key={index}><strong>{number.format(moment.seconds)} s</strong> · {moment.text}</li>
+                      ))}
+                    </ul>
+                  </details>
+                ) : null)}
+                {finding.sources.map(source => source.transcript?.length ? (
+                  <details className="ig-frames" key={source.id + '-transcript'}>
+                    <summary>Transcripción · {source.title ?? 'Video'}</summary>
+                    <ul>
+                      {source.transcript.map((segment, index) => {
+                        const url = transcriptLink(source.url, segment.start);
+                        const time = transcriptTime(segment.start);
+                        return <li key={index}>
+                          {url ? <a href={url} target="_blank" rel="noopener noreferrer">{time}</a> : <strong>{time}</strong>}
+                          {' · '}{segment.text}
+                        </li>;
+                      })}
+                    </ul>
+                  </details>
+                ) : null)}
               </li>
             ))}
           </ul>
@@ -102,10 +131,14 @@ export default function InfographicView({ report, analysis, articleRef }: Props)
           </div>
         </section>
 
-        {(analysis.skippedPosts > 0 || report.limitation) && (
+        {(analysis.skippedPosts > 0 || report.limitation || contextSummary || !!report.transcriptNotes?.length) && (
           <aside className="ig-scope" aria-label="Alcance del análisis">
             <strong>Alcance del análisis</strong>
             {report.limitation && <p>{report.limitation}</p>}
+            {contextSummary && <p>{contextSummary}</p>}
+            {report.transcriptNotes?.map(note => (
+              <p key={note.url}><a href={note.url} target="_blank" rel="noopener noreferrer">{note.label}</a> · {note.detail}</p>
+            ))}
             {analysis.skippedPosts > 0 && (
               <p>Publicaciones sin identificador omitidas del análisis · {number.format(analysis.skippedPosts)}</p>
             )}

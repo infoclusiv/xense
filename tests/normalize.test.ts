@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extractListsFromPayload, extractTweetsFromPayload } from '../lib/x/normalize';
+import { extractListsFromPayload, extractTweetsFromPayload, mergePostContext, normalizeTweetResult } from '../lib/x/normalize';
 
 const COLLECTED_AT = '2026-11-13T10:00:00.000Z';
 
@@ -72,6 +72,88 @@ function payloadWith(entries: unknown[]) {
 }
 
 describe('extractTweetsFromPayload', () => {
+  it('conserva padre, raíz, cita y Artículo de X en una captura de detalle', () => {
+    const original = originalTweet();
+    const reply = {
+      ...original,
+      rest_id: '200',
+      legacy: {
+        ...original.legacy,
+        in_reply_to_status_id_str: '65',
+        conversation_id_str: '40',
+        quoted_status_id_str: '123',
+      },
+      quoted_status_result: {
+        result: {
+          ...original,
+          article: { article_results: { result: {
+            rest_id: '999',
+            title: 'Informe',
+            content_state: { blocks: [{ text: 'Primera sección' }, { text: 'Segunda sección' }] },
+          } } },
+        },
+      },
+    };
+    const [post] = extractTweetsFromPayload({ data: { tweetResult: { result: reply } } }, COLLECTED_AT);
+    expect(post).toMatchObject({
+      replyToPostId: '65', conversationId: '40', quotedPostId: '123', isReply: true, isQuote: true,
+      quoted: {
+        urls: ['https://example.com/nota'],
+        media: [{ alt: 'Una foto' }],
+        article: {
+          title: 'Informe', url: 'https://x.com/i/article/999', text: 'Primera sección\n\nSegunda sección',
+        },
+      },
+    });
+    expect(normalizeTweetResult({ ...reply, quoted_status_result: undefined }, COLLECTED_AT))
+      .toMatchObject({ quotedPostId: '123', quoted: null, isQuote: true });
+  });
+
+  it('completa una captura anterior sin perder el autor ni los adjuntos ya disponibles', () => {
+    const original = originalTweet();
+    const full = normalizeTweetResult(original, COLLECTED_AT)!;
+    const initial = {
+      ...full, text: 'Hola', media: [], captureSource: 'dom' as const,
+      replyToPostId: '42', conversationId: '41',
+    };
+    const merged = mergePostContext(initial, full);
+    expect(merged).toMatchObject({ text: full.text, media: full.media, replyToPostId: '42', conversationId: '41' });
+    expect(mergePostContext(merged, initial)).toEqual(merged);
+  });
+
+  it('conserva el orden original de secciones, GIFs y posts incrustados en artículos', () => {
+    const original = originalTweet();
+    const gif = 'https://video.twimg.com/tweet_video/example.mp4';
+    const [post] = extractTweetsFromPayload(payloadWith([entry('tweet-123', {
+      ...original,
+      article: { article_results: { result: {
+        rest_id: '999',
+        title: 'Informe',
+        media_entities: [{ media_id: '30', media_info: {
+          __typename: 'AnimatedGif', variants: [{ url: gif, content_type: 'video/mp4' }],
+        } }],
+        content_state: {
+          entityMap: [
+            { key: '4', value: { data: { mediaItems: [{ mediaId: '30' }], caption: 'Evolución' } } },
+            { key: '7', value: { data: { tweetId: '15', title: 'Publicación original' } } },
+          ],
+          blocks: [
+            { type: 'header-two', text: 'Resultados' },
+            { type: 'unstyled', text: 'Observa la animación.' },
+            { type: 'atomic', text: ' ', entityRanges: [{ key: 4 }] },
+            { type: 'atomic', text: ' ', entityRanges: [{ key: 7 }] },
+          ],
+        },
+      } } },
+    })]), COLLECTED_AT);
+    expect(post?.article?.blocks).toEqual([
+      { kind: 'heading', text: 'Resultados' },
+      { kind: 'text', text: 'Observa la animación.' },
+      { kind: 'media', media: expect.objectContaining({ type: 'gif', url: gif }), caption: 'Evolución' },
+      { kind: 'embed', url: 'https://x.com/i/status/15', text: 'Publicación original' },
+    ]);
+  });
+
   it('normaliza un post original con autor, métricas, entidades y media', () => {
     const posts = extractTweetsFromPayload(payloadWith([entry('tweet-123', originalTweet())]), COLLECTED_AT);
 

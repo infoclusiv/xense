@@ -205,6 +205,19 @@
   background: #d9eeea;
 }
 
+.ig-frames {
+  margin-top: 0.65rem;
+  font-size: 0.85rem;
+}
+
+.ig-frames summary {
+  cursor: pointer;
+}
+
+.ig-frames li + li {
+  margin-top: 0.25rem;
+}
+
 .ig-charts {
   grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
 }

@@ -164,6 +164,8 @@ Con **ChatGPT (Codex CLI)**, Xense consulta los modelos al abrir los resultados 
 
 La infografía aparece en el dashboard con una conclusión principal, hallazgos enlazados a los posts originales y gráficos calculados a partir de la recolección. El resultado queda disponible en **Análisis guardados**. Con **Descargar HTML** puedes abrir el informe en un navegador sin conexión. Para guardar un PDF, abre ese archivo y elige **Imprimir → Guardar como PDF**.
 
+Con **Recuperar contexto y analizar adjuntos**, Xense busca las respuestas, citas e hilos primero en la recolección y en el historial local. Puede abrir el detalle en X para completar referencias y leer páginas públicas enlazadas. Los hallazgos pueden citar los posts relacionados, artículos e imágenes que los respaldan. Las métricas de la infografía se calculan con los posts de la lista. El informe indica cuántas fuentes se leyeron y cuántas quedaron parciales, inaccesibles o sin recuperar. Consulta los [límites y requisitos del puente](companion/README.md#contexto-y-adjuntos).
+
 ---
 
 ## Cómo funciona
@@ -247,7 +249,7 @@ npm run zip       # empaqueta la extensión
 - Los posts, listas, ajustes y el seguimiento por lista se guardan en IndexedDB y `chrome.storage.local` dentro del navegador.
 - La extensión solo se ejecuta en `x.com` y `twitter.com`.
 - Las exportaciones se generan localmente y se descargan como archivos.
-- Al generar una infografía, los textos de los posts se envían al proveedor de IA seleccionado.
+- Al generar una infografía, el proveedor seleccionado recibe los textos de los posts y los extractos de contexto utilizados. Con la recuperación de adjuntos activa, el proveedor también puede recibir imágenes o fotogramas seleccionados.
 
 ---
 

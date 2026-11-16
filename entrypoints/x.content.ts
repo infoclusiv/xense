@@ -5,6 +5,7 @@ import type {
   ListInfo,
   MediaItem,
   NormalizedPost,
+  PostArticle,
 } from '../lib/types';
 import {
   humanizeProfile,
@@ -19,7 +20,9 @@ import {
   type Point,
 } from '../lib/x/humanize';
 import { listPassReachedStart } from '../lib/x/strategy';
-import { matchesWindowUrl } from '../lib/x/urls';
+import { mergePostContext } from '../lib/x/normalize';
+import { articleText, readArticleBlocks } from '../lib/article';
+import { articleIdFromPath, matchesWindowUrl, postIdFromPath, postIdFromUrl } from '../lib/x/urls';
 
 const PAGE_SOURCE = 'xense-page';
 const FRONTIER_SIZE = 24;
@@ -38,7 +41,10 @@ let queuedPosts: NormalizedPost[] = [];
 let flushing: Promise<void> | null = null;
 let flushScheduled = false;
 
-const windowSeen = new Set<string>();
+const windowSeen = new Map<string, NormalizedPost>();
+const detailPosts = new Map<string, NormalizedPost>();
+let detailLimited = false;
+let detailPage = false;
 let currentWindowCaptured = 0;
 let oldestSeenMs: number | null = null;
 let hadPayload = false;
@@ -67,6 +73,7 @@ export default defineContentScript({
   matches: ['https://x.com/*', 'https://twitter.com/*'],
   runAt: 'document_start',
   main() {
+    detailPage = location.hash === '#xense-context';
     window.addEventListener('message', onPageMessage, false);
     chrome.runtime.onMessage.addListener(onRuntimeMessage);
     watchTrustedUserInput();
@@ -140,6 +147,17 @@ function onPageMessage(event: MessageEvent): void {
   if (!data || data.source !== PAGE_SOURCE) return;
   const onCollectionPage = context && scraping && matchesWindowUrl(location.href, context.expectedUrl);
 
+  if (detailPage && data.kind === 'detail_limited') detailLimited = true;
+  if (detailPage && data.kind === 'detail' && Array.isArray(data.posts)) {
+    for (const post of (data.posts as NormalizedPost[]).slice(0, 300)) {
+      if (/^\d{1,30}$/.test(post?.id) && typeof post.text === 'string' && post.author
+        && Array.isArray(post.media) && Array.isArray(post.urls)) {
+        detailPosts.set(post.id, mergePostContext(detailPosts.get(post.id), post));
+      }
+    }
+    return;
+  }
+
   if (data.kind === 'rate_limited' && (!contextResolved || onCollectionPage)) {
     rateLimited = true;
     return;
@@ -166,6 +184,35 @@ function onRuntimeMessage(
   _sender: chrome.runtime.MessageSender,
   sendResponse: (response?: unknown) => void,
 ): boolean {
+  if (message?.type === 'READ_X_CONTEXT' && detailPage) {
+    const id = postIdFromPath(location.pathname);
+    const articleId = articleIdFromPath(location.pathname);
+    if (articleId && articleId === message.articleId) {
+      sendResponse({ limited: detailLimited, article: readDomArticle(articleId) });
+    } else if (message.postId && (id === message.postId || detailPosts.has(message.postId))) {
+      const domPost = scrapeDomPosts().find(post => post.id === message.postId);
+      const captured = detailPosts.get(message.postId);
+      const post = domPost ? mergePostContext(captured, domPost) : captured;
+      const related: NormalizedPost[] = [];
+      const seen = new Set([message.postId]);
+      const ids = [post?.replyToPostId, post?.conversationId, post?.quotedPostId, post?.originalPostId];
+      for (const relatedId of ids) {
+        if (!relatedId || seen.has(relatedId) || related.length >= 5) continue;
+        seen.add(relatedId);
+        const adjacent = detailPosts.get(relatedId);
+        if (!adjacent) continue;
+        related.push(adjacent);
+        ids.push(adjacent.replyToPostId, adjacent.quotedPostId);
+      }
+      sendResponse({
+        limited: detailLimited,
+        captured: Boolean(captured),
+        post,
+        related,
+      });
+    }
+    return false;
+  }
   if (message?.type === 'SCRAPER_PAUSE') {
     paused = true;
     sendResponse({ ok: true });
@@ -264,11 +311,12 @@ function processIncomingPosts(posts: NormalizedPost[], fromDom: boolean): void {
     if (!context.includeReposts && post.isRepost) continue;
     if (!context.includeReplies && post.isReply) continue;
     if (!context.includeQuotes && post.isQuote && !post.isReply && !post.isRepost) continue;
-    if (windowSeen.has(post.id)) continue;
-
-    windowSeen.add(post.id);
-    currentWindowCaptured += 1;
-    queuedPosts.push(post);
+    const previous = windowSeen.get(post.id);
+    const merged = mergePostContext(previous, post);
+    if (previous && JSON.stringify(previous) === JSON.stringify(merged)) continue;
+    windowSeen.set(post.id, merged);
+    if (!previous) currentWindowCaptured += 1;
+    queuedPosts.push(merged);
   }
 
   scheduleFlush();
@@ -560,15 +608,16 @@ async function runScraper(ctx: ContentContext): Promise<void> {
         return;
       }
 
-      if (!hadPayload && Date.now() - lastDomScan > 3500) {
+      if (Date.now() - lastDomScan > 3500) {
         const domPosts = scrapeDomPosts();
         lastDomScan = Date.now();
-        if (domPosts.length > 0) {
-          if (!domFallbackUsed) {
+        const validDomPosts = hadPayload ? domPosts.filter(post => windowSeen.has(post.id)) : domPosts;
+        if (validDomPosts.length > 0) {
+          if (!hadPayload && !domFallbackUsed) {
             domFallbackUsed = true;
             diagnostic('warn', 'No se detectaron respuestas GraphQL; usando extracción desde el DOM.');
           }
-          processIncomingPosts(domPosts, true);
+          processIncomingPosts(validDomPosts, true);
         }
       }
 
@@ -961,19 +1010,50 @@ function parseCompactNumber(value: string): number {
   return Math.round(number);
 }
 
+function postElements<T extends Element>(root: HTMLElement, selector: string): T[] {
+  const quote = root.closest('[data-testid="quoteTweet"]');
+  return [...root.querySelectorAll<T>(selector)].filter(element => element.closest('[data-testid="quoteTweet"]') === quote);
+}
+
+function readDomUrls(root: HTMLElement): string[] {
+  const links = postElements<HTMLAnchorElement>(root,
+    '[data-testid="tweetText"] a[href], [data-testid="card.wrapper"] a[href], a[data-testid="card.wrapper"][href], a[href*="/i/article/"]');
+  return [...new Set(links.map(link => link.href).filter(url => /^https?:\/\//.test(url)))];
+}
+
+function readDomMedia(root: HTMLElement): MediaItem[] {
+  const media = new Map<string, MediaItem>();
+  for (const video of postElements<HTMLVideoElement>(root, 'video')) {
+    const url = video.currentSrc || video.src || video.querySelector<HTMLSourceElement>('source[src]')?.src;
+    const thumbnail = video.poster || undefined;
+    if (url && /^https:\/\/video\.twimg\.com\//.test(url)) {
+      media.set(url, { type: 'video', url, thumbnail });
+    } else if (thumbnail) {
+      media.set(thumbnail, { type: 'video', url: thumbnail, thumbnail });
+    }
+  }
+  for (const image of postElements<HTMLImageElement>(root, 'img[src*="pbs.twimg.com/media"]')) {
+    const url = image.getAttribute('src');
+    if (!url || media.has(url)) continue;
+    const alt = image.getAttribute('alt')?.trim();
+    media.set(url, { type: 'photo', url, alt: alt && !/^(image|imagen)$/i.test(alt) ? alt : undefined });
+  }
+  return [...media.values()];
+}
+
 function scrapeDomPosts(): NormalizedPost[] {
   const articles = Array.from(document.querySelectorAll<HTMLElement>('article[data-testid="tweet"]'));
   const collectedAt = nowIso();
   const posts = new Map<string, NormalizedPost>();
 
   for (const article of articles) {
-    const time = article.querySelector('time[datetime]');
+    const [time] = postElements<HTMLTimeElement>(article, 'time[datetime]');
     const createdAtRaw = time?.getAttribute('datetime');
     if (!createdAtRaw) continue;
     const createdMs = Date.parse(createdAtRaw);
     if (!Number.isFinite(createdMs)) continue;
 
-    const links = Array.from(article.querySelectorAll<HTMLAnchorElement>('a[href*="/status/"]'));
+    const links = postElements<HTMLAnchorElement>(article, 'a[href*="/status/"]');
     let id: string | undefined;
     const timeMatch = /\/status\/(\d+)/.exec(
       time?.closest('a[href*="/status/"]')?.getAttribute('href') ?? '',
@@ -990,7 +1070,7 @@ function scrapeDomPosts(): NormalizedPost[] {
     }
     if (!id) continue;
 
-    const userBlock = article.querySelector<HTMLElement>('[data-testid="User-Name"]');
+    const [userBlock] = postElements<HTMLElement>(article, '[data-testid="User-Name"]');
     const userText = (userBlock?.innerText ?? '').trim();
     const handleMatch = /@([A-Za-z0-9_]+)/.exec(userText);
     const handle = handleMatch?.[1] ?? 'desconocido';
@@ -1000,7 +1080,8 @@ function scrapeDomPosts(): NormalizedPost[] {
         .map((line) => line.trim())
         .find((line) => line && !line.startsWith('@')) ?? handle;
 
-    const text = (article.querySelector<HTMLElement>('[data-testid="tweetText"]')?.innerText ?? '').trim();
+    const [textBlock] = postElements<HTMLElement>(article, '[data-testid="tweetText"]');
+    const text = (textBlock?.innerText ?? '').trim();
     const articleText = (article.innerText ?? '').toLowerCase();
     const socialText = (
       article.querySelector<HTMLElement>('[data-testid="socialContext"]')?.innerText ?? ''
@@ -1015,14 +1096,11 @@ function scrapeDomPosts(): NormalizedPost[] {
       return parseCompactNumber(element.getAttribute('aria-label') ?? element.innerText ?? '');
     };
 
-    const media: MediaItem[] = [];
-    const mediaSeen = new Set<string>();
-    for (const image of Array.from(article.querySelectorAll<HTMLImageElement>('img[src*="pbs.twimg.com/media"]'))) {
-      const url = image.getAttribute('src');
-      if (!url || mediaSeen.has(url)) continue;
-      mediaSeen.add(url);
-      media.push({ type: 'photo', url, alt: image.getAttribute('alt') ?? undefined });
-    }
+    const quote = article.querySelector<HTMLElement>('[data-testid="quoteTweet"]');
+    const quoteUrl = quote && postElements<HTMLAnchorElement>(quote, 'a[href*="/status/"]')[0]?.href;
+    const quotedPostId = quoteUrl && postIdFromUrl(quoteUrl) || undefined;
+    const quotedText = quote?.querySelector<HTMLElement>('[data-testid="tweetText"]')?.innerText.trim();
+    const quotedHandle = quote?.querySelector<HTMLElement>('[data-testid="User-Name"]')?.innerText.match(/@(\w+)/)?.[1];
 
     posts.set(id, {
       id,
@@ -1034,10 +1112,16 @@ function scrapeDomPosts(): NormalizedPost[] {
       isRepost,
       isQuote,
       repostedBy: null,
-      urls: [],
+      originalPostId: isRepost ? id : undefined,
+      quotedPostId,
+      quoted: quote && quotedPostId
+        ? { id: quotedPostId, handle: quotedHandle, text: quotedText ?? '', permalink: quoteUrl || undefined,
+          urls: readDomUrls(quote), media: readDomMedia(quote) }
+        : undefined,
+      urls: readDomUrls(article),
       hashtags: [],
       mentions: [],
-      media,
+      media: readDomMedia(article),
       metrics: {
         likes: metric('like'),
         reposts: metric('retweet'),
@@ -1048,10 +1132,29 @@ function scrapeDomPosts(): NormalizedPost[] {
       },
       permalink: `https://x.com/${handle}/status/${id}`,
       collectedAt,
+      captureSource: 'dom',
     });
   }
 
   return [...posts.values()];
+}
+
+function readDomArticle(id: string): PostArticle | undefined {
+  const body = document.querySelector<HTMLElement>(
+    '[data-testid="twitterArticleRichTextView"], [data-testid="articleRichTextView"]',
+  );
+  if (!body) return;
+  const url = `https://x.com/i/article/${id}`;
+  const blocks = readArticleBlocks(body, url);
+  const text = articleText(blocks) || body.innerText.trim().slice(0, 40_000);
+  if (!text && !blocks.length) return;
+  return {
+    url,
+    title: document.querySelector<HTMLElement>('[data-testid="twitterArticleTitle"], main h1')?.innerText.trim(),
+    text,
+    blocks,
+    blocksFromDetail: true,
+  };
 }
 
 function isListsIndexPage(): boolean {

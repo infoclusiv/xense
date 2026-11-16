@@ -1,6 +1,7 @@
 import type { AiAnalysis, AiAnalysisType, AiProvider } from '../../lib/ai/analysis';
 import { nativeRequest } from '../../lib/ai/native';
 import { analyzeCollection } from '../../lib/ai/run-analysis';
+import type { Transcription } from '../../lib/ai/transcript';
 import { getAnalysesForRun, saveAnalysis } from '../../lib/db';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatLocalDateTime } from '../../lib/dates/parse';
@@ -26,6 +27,7 @@ import {
 } from '../../lib/ui/api';
 import InfographicView from './Infographic';
 import CodexModelPicker from './CodexModelPicker';
+import TranscriptImport from './TranscriptImport';
 import { useCodexModels } from './useCodexModels';
 
 type TypeFilter = 'all' | PostType;
@@ -70,6 +72,8 @@ export default function App() {
   const [aiProvider, setAiProvider] = useState<AiProvider>('chatgpt_codex');
   const [aiType, setAiType] = useState<AiAnalysisType>('themes');
   const [aiPrompt, setAiPrompt] = useState('');
+  const [aiEnrich, setAiEnrich] = useState(true);
+  const [transcriptImports, setTranscriptImports] = useState<ReadonlyMap<string, Transcription>>(() => new Map());
   const [openCodeModel, setOpenCodeModel] = useState('');
   const [aiHistory, setAiHistory] = useState<AiAnalysis[]>([]);
   const [aiBusy, setAiBusy] = useState(false);
@@ -218,9 +222,14 @@ export default function App() {
     try {
       const response = await nativeRequest({ type: 'PING' });
       const status = response.providers?.[aiProvider];
-      setAiConnection(status?.installed
+      const providerStatus = status?.installed
         ? (status?.version ? status.version + ' · CLI accesible. La sesión se comprobará al analizar.' : 'CLI instalado y accesible. La sesión se comprobará al analizar.')
-        : 'Puente conectado, pero no se detectó el CLI seleccionado.');
+        : 'Puente conectado, pero no se detectó el CLI seleccionado.';
+      const transcripts = response.transcripts;
+      setAiConnection(providerStatus + (transcripts ? [
+        '', transcripts.whisperx ? 'WhisperX detectado' : 'WhisperX pendiente de configurar',
+        transcripts.youtube ? 'yt-dlp detectado' : 'yt-dlp pendiente de configurar',
+      ].join(' · ') : ''));
     } catch (error) {
       setAiConnection('');
       setAiError(getErrorMessage(error));
@@ -240,6 +249,8 @@ export default function App() {
         model: usesCodex ? codexModels.model : openCodeModel,
         kind: aiType,
         instruction: aiPrompt,
+        enrich: aiEnrich,
+        transcriptImports,
         signal: controller.signal,
         onProgress: setAiProgress,
       });
@@ -265,7 +276,7 @@ export default function App() {
   const stopAnalysis = () => {
     aiController.current?.abort();
     setAiStopping(true);
-    setAiProgress('Deteniendo el análisis al terminar la consulta en curso…');
+    setAiProgress('Deteniendo el análisis…');
   };
 
   const downloadInfographic = () => {
@@ -466,8 +477,7 @@ export default function App() {
             </div>
           </div>
           <p className="hint">
-            Genera una infografía con los hallazgos y los gráficos de toda la recolección.
-            Las publicaciones se envían al proveedor que selecciones mediante el CLI instalado en Windows.
+            El proveedor seleccionado recibe las publicaciones y las fuentes de contexto usadas en el análisis.
           </p>
           <div className="ai-form">
             <label>
@@ -505,6 +515,23 @@ export default function App() {
               </label>
             )}
           </div>
+          <label className="toggle" aria-describedby="ai-context-hint">
+            <input type="checkbox" checked={aiEnrich} disabled={aiBusy}
+              onChange={event => setAiEnrich(event.target.checked)} />
+            <span>Recuperar contexto y analizar adjuntos</span>
+          </label>
+          <p className="hint" id="ai-context-hint">
+            Consulta posts relacionados y enlaces públicos. El proveedor puede recibir imágenes o fotogramas
+            seleccionados. El informe muestra las fuentes leídas y las que quedaron pendientes.
+          </p>
+          <TranscriptImport disabled={aiBusy} imports={transcriptImports} onChange={(id, transcript) => {
+            setTranscriptImports(previous => {
+              const next = new Map(previous);
+              if (transcript) next.set(id, transcript);
+              else next.delete(id);
+              return next;
+            });
+          }} />
           <div className="button-row">
             <button className="btn btn-primary" disabled={aiBusy || !data.posts.length || modelPreferenceLoading}
               onClick={() => void analyzeWithAi()}>

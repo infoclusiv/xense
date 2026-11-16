@@ -1,5 +1,5 @@
 import { extractListsFromPayload, extractTweetsFromPayload } from '../lib/x/normalize';
-import { operationFromGraphqlUrl } from '../lib/x/urls';
+import { articleIdFromPath, operationFromGraphqlUrl, postIdFromPath } from '../lib/x/urls';
 
 declare global {
   interface Window {
@@ -8,6 +8,7 @@ declare global {
 }
 
 const SOURCE = 'xense-page';
+let detailPage = false;
 
 function readOperation(method: string, requestUrl: string): string | null {
   if (method.toUpperCase() !== 'GET') return null;
@@ -18,6 +19,8 @@ function readOperation(method: string, requestUrl: string): string | null {
   if (!lower) return null;
 
   const path = location.pathname.replace(/\/+$/, '');
+  if (detailPage && (postIdFromPath(path) || articleIdFromPath(path))
+    && ['tweetdetail', 'tweetresultbyrestid'].includes(lower)) return operation;
   if (lower.includes('searchtimeline')) {
     const query = new URLSearchParams(location.search).get('q') ?? '';
     return path === '/search' && /^list:\d+\s/i.test(query) ? operation : null;
@@ -35,10 +38,18 @@ function reportRateLimit(operation: string): void {
   if (hasTweetTimeline(operation)) {
     window.postMessage({ source: SOURCE, kind: 'rate_limited', operation }, location.origin);
   }
+  if (detailPage && !hasTweetTimeline(operation)) {
+    window.postMessage({ source: SOURCE, kind: 'detail_limited' }, location.origin);
+  }
 }
 
 function forward(operation: string, data: unknown): void {
   try {
+    if (detailPage && !hasTweetTimeline(operation) && !operation.toLowerCase().includes('list')) {
+      const posts = extractTweetsFromPayload(data);
+      window.postMessage({ source: SOURCE, kind: 'detail', posts }, location.origin);
+      return;
+    }
     if (hasTweetTimeline(operation)) {
       const posts = extractTweetsFromPayload(data);
       if (posts.length > 0) {
@@ -70,6 +81,7 @@ export default defineContentScript({
   main() {
     if (window.__xenseHookInstalled) return;
     window.__xenseHookInstalled = true;
+    detailPage = location.hash === '#xense-context';
 
     const originalFetch = window.fetch;
     window.fetch = (...args: Parameters<typeof fetch>): Promise<Response> => {

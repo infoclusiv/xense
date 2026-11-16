@@ -1,11 +1,18 @@
 import { DateTime } from 'luxon';
 import type { DateRangeInfo, NormalizedPost, RunData, RunStats } from '../types';
+import { postIdFromUrl } from '../x/urls';
+import { contextCoverageText, webUrl, type ContextCoverage, type ContextEvidence } from './evidence';
+import { pickTranscriptSegments, transcriptLabel, transcriptLink, transcriptTime, type TranscriptSegment } from './transcript';
 
 interface Source {
   id: string;
   handle: string;
   url: string;
   createdAt: string;
+  title?: string;
+  method?: string;
+  moments?: ContextEvidence['moments'];
+  transcript?: TranscriptSegment[];
 }
 
 interface Finding {
@@ -25,6 +32,7 @@ export interface Infographic {
   takeaway: string;
   findings: Finding[];
   limitation: string;
+  transcriptNotes?: Array<{ url: string; label: string; detail: string }>;
   collection: {
     name: string;
     period: string;
@@ -49,7 +57,24 @@ function sourceForPost(post: NormalizedPost): Source | undefined {
   if (!/^\d{1,30}$/.test(post.id)) return;
   const handle = post.author.handle;
   const path = /^[\w]{1,50}$/.test(handle) ? handle + '/status/' : 'i/web/status/';
-  return { id: post.id, handle, url: 'https://x.com/' + path + post.id, createdAt: post.createdAt };
+  const originalUrl = post.isRepost && postIdFromUrl(post.permalink) === post.originalPostId
+    && post.originalPostId ? webUrl(post.permalink) : undefined;
+  return { id: post.id, handle, url: originalUrl ?? 'https://x.com/' + path + post.id, createdAt: post.createdAt };
+}
+
+function sourceForContext(evidence: ContextEvidence, hint: string): Source | undefined {
+  const url = evidence.url && webUrl(evidence.url);
+  if (!url || !['complete', 'partial'].includes(evidence.status)) return;
+  if (!evidence.text && !evidence.title && !evidence.handle && !evidence.visual && !evidence.moments?.length
+    && evidence.transcription?.status !== 'ready' && !evidence.alt) return;
+  const labels = { post: 'Post relacionado', article: 'Artículo', link: 'Página enlazada', image: 'Imagen', video: 'Video o GIF' };
+  return {
+    id: evidence.id, url, handle: evidence.handle ?? '', createdAt: evidence.createdAt ?? '',
+    title: readText(evidence.title, 160) || (evidence.handle ? '@' + evidence.handle : labels[evidence.kind]),
+    method: evidence.method,
+    moments: evidence.moments,
+    transcript: evidence.transcription?.status === 'ready' ? pickTranscriptSegments(evidence.transcription, hint) : undefined,
+  };
 }
 
 function collectionPeriod(range: DateRangeInfo): string {
@@ -88,7 +113,11 @@ function summarizeActivity(days: RunStats['days']): Activity[] {
   });
 }
 
-export function buildInfographic(text: string, data: RunData): Infographic {
+export function buildInfographic(
+  text: string,
+  data: RunData,
+  evidence: ReadonlyMap<string, ContextEvidence> = new Map(),
+): Infographic {
   const json = text.trim().replace(/^```(?:json)?\s*([\s\S]*?)\s*```$/i, '$1');
   let payload: unknown;
   try {
@@ -111,18 +140,20 @@ export function buildInfographic(text: string, data: RunData): Infographic {
     const source = sourceForPost(post);
     if (source && !sourcesById.has(post.id)) sourcesById.set(post.id, source);
   }
-
   const findings = payload.findings.slice(0, 6).map((item: unknown): Finding => {
-    if (!isRecord(item) || !Array.isArray(item.postIds)) {
+    if (!isRecord(item)) {
       throw new Error('El proveedor devolvió un hallazgo sin referencias.');
     }
+    const idsInput = item.sourceIds ?? item.postIds;
+    if (!Array.isArray(idsInput)) throw new Error('El proveedor devolvió un hallazgo sin referencias.');
     const findingTitle = readText(item.title, 160);
     const detail = readText(item.detail, 550);
-    const ids = new Set(item.postIds.filter((id): id is string => typeof id === 'string').map(id => id.trim()));
+    const ids = new Set(idsInput.filter((id): id is string => typeof id === 'string').map(id => id.trim()));
     const sources = [...ids].flatMap(id => {
-      const source = sourcesById.get(id);
+      const context = evidence.get(id);
+      const source = sourcesById.get(id) ?? (context && sourceForContext(context, findingTitle + ' ' + detail));
       return source ? [source] : [];
-    }).slice(0, 3);
+    }).slice(0, 4);
 
     if (!findingTitle || !detail || !sources.length) {
       throw new Error('El proveedor devolvió un hallazgo incompleto o sin respaldo en la recolección.');
@@ -132,11 +163,19 @@ export function buildInfographic(text: string, data: RunData): Infographic {
 
   const { config } = data.run;
   const { total, authors, byType, days } = data.stats;
+  const transcriptNotes = [...evidence.values()].flatMap(source => {
+    const url = source.url && webUrl(source.url);
+    const transcript = source.transcription;
+    if (!url || !transcript || transcript.status === 'skipped'
+      || (transcript.status === 'ready' && transcript.complete !== false)) return [];
+    return [{ url, label: source.title || 'Video o GIF', detail: transcriptLabel(transcript) }];
+  });
   return {
     title,
     takeaway,
     findings,
     limitation: readText(payload.limitation, 550),
+    transcriptNotes: transcriptNotes.length ? transcriptNotes : undefined,
     collection: {
       name: config.listName,
       period: collectionPeriod(config.range),
@@ -156,15 +195,36 @@ function markdownText(value: string): string {
     .replace(/[\\`*_{}\[\]()#+.!|~]/g, '\\$&');
 }
 
-export function infographicMarkdown(report: Infographic): string {
+export function infographicMarkdown(report: Infographic, coverage?: ContextCoverage): string {
+  const scope = [report.limitation, contextCoverageText(coverage)].filter(Boolean).map(markdownText);
+  for (const note of report.transcriptNotes ?? []) {
+    scope.push(`[${markdownText(note.label)}](<${note.url}>) · ${markdownText(note.detail)}`);
+  }
   return [
     '# ' + markdownText(report.title),
     markdownText(report.takeaway),
     ...report.findings.map(finding => [
       '## ' + markdownText(finding.title),
       markdownText(finding.detail),
-      finding.sources.map(source => `[@${markdownText(source.handle)}](${source.url})`).join(' · '),
+      finding.sources.map(source => {
+        const label = (source.title ?? '@' + source.handle) + (source.method ? ' · ' + source.method : '');
+        return `[${markdownText(label)}](<${source.url}>)`;
+      }).join(' · '),
+      ...finding.sources.flatMap(source => source.moments?.length ? [[
+        'Fotogramas · ' + markdownText(source.title ?? 'Video o GIF'),
+        '',
+        ...source.moments.map(moment => `- ${moment.seconds} s · ${markdownText(moment.text)}`),
+      ].join('\n')] : []),
+      ...finding.sources.flatMap(source => source.transcript?.length ? [[
+        'Transcripción · ' + markdownText(source.title ?? 'Video'),
+        '',
+        ...source.transcript.map(segment => {
+          const time = transcriptTime(segment.start);
+          const url = transcriptLink(source.url, segment.start);
+          return `- ${url ? `[${time}](<${url}>)` : time} · ${markdownText(segment.text)}`;
+        }),
+      ].join('\n')] : []),
     ].join('\n\n')),
-    ...(report.limitation ? ['## Alcance del análisis\n\n' + markdownText(report.limitation)] : []),
+    ...(scope.length ? ['## Alcance del análisis\n\n' + scope.join('\n\n')] : []),
   ].join('\n\n') + '\n';
 }

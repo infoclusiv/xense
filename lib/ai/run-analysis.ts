@@ -3,6 +3,9 @@ import {
   type AiAnalysis, type AiAnalysisType, type AiProvider,
 } from './analysis';
 import { buildInfographic, infographicMarkdown } from './infographic';
+import { collectAnalysisContext } from './context';
+import type { ContextEvidence } from './evidence';
+import type { Transcription } from './transcript';
 import { nativeRequest } from './native';
 import type { RunData } from '../types';
 
@@ -13,13 +16,24 @@ interface AnalysisOptions {
   instruction: string;
   signal: AbortSignal;
   onProgress: (message: string) => void;
+  enrich?: boolean;
+  transcriptImports?: ReadonlyMap<string, Transcription>;
 }
 
 export async function analyzeCollection(data: RunData, options: AnalysisOptions): Promise<AiAnalysis> {
   const { provider, kind, instruction, signal, onProgress } = options;
   const model = options.model.trim();
-  const { prompts, processed, skipped } = makeAnalysisPrompts(data.posts, kind, instruction);
+  if (kind === 'custom' && !instruction.trim()) throw new Error('Escribe qué quieres analizar.');
+  const { posts, evidence } = await collectAnalysisContext(data.posts, { ...options, model, runId: data.run.id });
+  const { prompts, processed, skipped } = makeAnalysisPrompts(posts, kind, instruction, evidence);
   if (!prompts.length) throw new Error('No hay publicaciones para analizar.');
+  const sources = new Map<string, ContextEvidence>();
+  for (const entries of evidence.values()) {
+    for (const { source } of entries) sources.set(source.id, source);
+  }
+  const contextCoverage = { complete: 0, partial: 0, unavailable: 0, skipped: 0 };
+  for (const source of sources.values()) contextCoverage[source.status] += 1;
+  const reportData = { ...data, posts };
 
   const ask = async (prompt: string) => {
     signal.throwIfAborted();
@@ -59,11 +73,11 @@ export async function analyzeCollection(data: RunData, options: AnalysisOptions)
   const answer = await ask(finalPrompt);
   let infographic;
   try {
-    infographic = buildInfographic(answer, data);
+    infographic = buildInfographic(answer, reportData, sources);
   } catch {
     onProgress('Volviendo a solicitar el formato de la infografía…');
-    const correction = 'Devuelve únicamente el JSON solicitado. Comprueba que cada hallazgo cite IDs exactos de las publicaciones de entrada.\n\n';
-    infographic = buildInfographic(await ask(correction + finalPrompt), data);
+    const correction = 'Devuelve únicamente el JSON solicitado. Usa IDs exactos de publicaciones o fuentes recuperadas del material suministrado.\n\n';
+    infographic = buildInfographic(await ask(correction + finalPrompt), reportData, sources);
   }
 
   return {
@@ -74,10 +88,11 @@ export async function analyzeCollection(data: RunData, options: AnalysisOptions)
     model,
     kind,
     prompt: kind === 'custom' ? instruction.trim() : '',
-    result: infographicMarkdown(infographic),
+    result: infographicMarkdown(infographic, contextCoverage),
     infographic,
     processedPosts: processed,
     skippedPosts: skipped,
     chunkCount: prompts.length,
+    contextCoverage,
   };
 }

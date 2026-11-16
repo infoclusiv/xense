@@ -152,6 +152,35 @@ export interface QuotedPost {
   text: string;
   createdAt?: string;
   permalink?: string;
+  media?: MediaItem[];
+  urls?: string[];
+  article?: PostArticle;
+  linkPreview?: LinkPreview;
+  quoted?: QuotedPost | null;
+  quotedPostId?: string;
+  replyToPostId?: string;
+}
+
+export interface PostArticle {
+  url?: string;
+  title?: string;
+  preview?: string;
+  text?: string;
+  urls?: string[];
+  media?: MediaItem[];
+  blocks?: ArticleBlock[];
+  blocksFromDetail?: boolean;
+}
+
+export type ArticleBlock =
+  | { kind: 'heading' | 'text'; text: string }
+  | { kind: 'media'; media: MediaItem; caption?: string }
+  | { kind: 'link' | 'embed'; url: string; text?: string };
+
+export interface LinkPreview {
+  url: string;
+  title?: string;
+  description?: string;
 }
 
 export interface MediaItem {
@@ -159,6 +188,8 @@ export interface MediaItem {
   url: string;
   thumbnail?: string;
   alt?: string;
+  durationMs?: number;
+  analysisUrl?: string;
 }
 
 export interface PostMetrics {
@@ -181,9 +212,15 @@ export interface NormalizedPost {
   isRepost: boolean;
   isQuote: boolean;
   replyToHandle?: string;
+  replyToPostId?: string;
+  conversationId?: string;
   repostedBy?: Author | null;
+  originalPostId?: string;
   originalCreatedAt?: string;
   quoted?: QuotedPost | null;
+  quotedPostId?: string;
+  article?: PostArticle;
+  linkPreview?: LinkPreview;
   urls: string[];
   hashtags: string[];
   mentions: string[];
@@ -191,6 +228,7 @@ export interface NormalizedPost {
   metrics: PostMetrics;
   permalink: string;
   collectedAt: string;
+  captureSource?: 'graphql' | 'dom';
 }
 
 export interface StoredPost extends NormalizedPost {

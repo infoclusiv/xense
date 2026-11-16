@@ -1,5 +1,6 @@
 import { DateTime } from 'luxon';
-import type { NormalizedPost, RunData } from '../types';
+import type { MediaItem, NormalizedPost, PostArticle, RunData } from '../types';
+import { relevantExcerpt } from '../ai/evidence';
 
 function localDate(iso: string, timezone: string): DateTime {
   return DateTime.fromISO(iso, { setZone: true }).setZone(timezone).setLocale('es');
@@ -238,19 +239,53 @@ export function buildAiDigest(data: RunData): string {
       `[${index + 1}] ${formatLocalShort(post.createdAt, timezone)} · @${post.author.handle} (${post.author.name}) · ${flags} · ❤ ${post.metrics.likes} · 🔁 ${post.metrics.reposts} · 💬 ${post.metrics.replies} · 👁 ${post.metrics.views}`,
     );
     lines.push(post.text || '[sin texto]');
-    if (post.quoted) {
-      lines.push(
-        `> Cita a @${post.quoted.handle ?? 'desconocido'}: ${post.quoted.text.replace(/\n/g, ' ')}`,
-      );
+    if (post.replyToPostId) lines.push(`Responde a https://x.com/i/status/${post.replyToPostId}`);
+    if (post.originalPostId) lines.push(`Publicación original https://x.com/i/status/${post.originalPostId}`);
+    if (post.conversationId && post.conversationId !== post.id && post.conversationId !== post.replyToPostId) {
+      lines.push(`Raíz del hilo https://x.com/i/status/${post.conversationId}`);
     }
-    if (post.media.length > 0) {
-      lines.push(`Media: ${post.media.map((item) => `${item.type}: ${item.url}`).join(' | ')}`);
+    if (post.urls.length) lines.push('Enlaces: ' + post.urls.join(' | '));
+    appendDigestAttachments(lines, post.media, post.article, post.text);
+    if (post.linkPreview?.title || post.linkPreview?.description) {
+      lines.push(`Vista previa del enlace ${post.linkPreview.url} · ${post.linkPreview.title ?? ''} ${post.linkPreview.description ?? ''}`);
     }
+    let quote = post.quoted;
+    for (let depth = 0; quote && depth < 4; depth++) {
+      const permalink = quote.permalink ?? `https://x.com/i/status/${quote.id}`;
+      lines.push(`> Cita a @${quote.handle ?? 'desconocido'} · ${permalink} · ${quote.text.replace(/\n/g, ' ')}`);
+      if (quote.urls?.length) lines.push('> Enlaces de la cita: ' + quote.urls.join(' | '));
+      appendDigestAttachments(lines, quote.media ?? [], quote.article, post.text, '> ');
+      quote = quote.quoted;
+    }
+    if (!post.quoted && post.quotedPostId) lines.push(`Cita sin texto recuperado https://x.com/i/status/${post.quotedPostId}`);
     lines.push(`URL: ${post.permalink}`);
     lines.push('');
   });
 
   return lines.join('\n');
+}
+
+function appendDigestAttachments(lines: string[], media: MediaItem[], article: PostArticle | undefined, hint: string, prefix = ''): void {
+  const positioned = new Set<string>();
+  if (article) {
+    lines.push(`${prefix}Artículo de X · ${article.title ?? ''} ${article.url ?? ''}`.trimEnd());
+    if (article.text) lines.push(`${prefix}Extracto · ${relevantExcerpt(article.text, hint, 900).replace(/\n/g, ' ')}`);
+    else if (article.preview) lines.push(`${prefix}Vista previa · ${article.preview}`);
+    let section = '';
+    for (const block of article.blocks ?? []) {
+      if (block.kind === 'heading') section = block.text;
+      const location = section ? ` · Sección ${section}` : '';
+      if ('media' in block) {
+        positioned.add(block.media.url);
+        lines.push(`${prefix}Adjunto del artículo · ${block.media.url}${location}${block.caption ? ' · ' + block.caption : ''}`);
+      } else if ('url' in block) {
+        lines.push(`${prefix}Enlace del artículo · ${block.url}${location}${block.text ? ' · ' + block.text : ''}`);
+      }
+    }
+  }
+  for (const item of [...media, ...(article?.media ?? []).filter(item => !positioned.has(item.url))]) {
+    lines.push(`${prefix}Adjunto ${item.type} · ${item.url}${item.alt ? ' · Texto alternativo: ' + item.alt : ''}`);
+  }
 }
 
 export function downloadTextFile(filename: string, content: string, mimeType: string): void {

@@ -1,6 +1,8 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
 import type { AiAnalysis } from './ai/analysis';
+import type { Transcription } from './ai/transcript';
 import type { ListInfo, NormalizedPost, RunRecord, StoredPost } from './types';
+import { mergePostContext } from './x/normalize';
 
 interface XenseDB extends DBSchema {
   analyses: {
@@ -21,7 +23,12 @@ interface XenseDB extends DBSchema {
   posts: {
     key: [string, string];
     value: StoredPost;
-    indexes: { 'by-run': string; 'by-run-date': [string, string] };
+    indexes: { 'by-run': string; 'by-run-date': [string, string]; 'by-id': string };
+  };
+  transcripts: {
+    key: [string, string];
+    value: { runId: string; url: string; transcription: Transcription };
+    indexes: { 'by-run': string };
   };
 }
 
@@ -29,20 +36,26 @@ let dbPromise: Promise<IDBPDatabase<XenseDB>> | null = null;
 
 export function getDB(): Promise<IDBPDatabase<XenseDB>> {
   if (!dbPromise) {
-    dbPromise = openDB<XenseDB>('xense-db', 2, {
-      upgrade(db, oldVersion) {
+    dbPromise = openDB<XenseDB>('xense-db', 4, {
+      upgrade(db, oldVersion, _newVersion, tx) {
         if (oldVersion < 2) {
           const analyses = db.createObjectStore('analyses', { keyPath: 'id' });
           analyses.createIndex('by-run', 'runId');
         }
-        if (oldVersion >= 1) return;
-        const lists = db.createObjectStore('lists', { keyPath: 'id' });
-        lists.createIndex('by-name', 'name');
-        const runs = db.createObjectStore('runs', { keyPath: 'id' });
-        runs.createIndex('by-created', 'createdAt');
-        const posts = db.createObjectStore('posts', { keyPath: ['runId', 'id'] });
-        posts.createIndex('by-run', 'runId');
-        posts.createIndex('by-run-date', ['runId', 'createdAt']);
+        if (oldVersion < 1) {
+          const lists = db.createObjectStore('lists', { keyPath: 'id' });
+          lists.createIndex('by-name', 'name');
+          const runs = db.createObjectStore('runs', { keyPath: 'id' });
+          runs.createIndex('by-created', 'createdAt');
+          const posts = db.createObjectStore('posts', { keyPath: ['runId', 'id'] });
+          posts.createIndex('by-run', 'runId');
+          posts.createIndex('by-run-date', ['runId', 'createdAt']);
+        }
+        if (oldVersion < 3) tx.objectStore('posts').createIndex('by-id', 'id');
+        if (oldVersion < 4) {
+          const transcripts = db.createObjectStore('transcripts', { keyPath: ['runId', 'url'] });
+          transcripts.createIndex('by-run', 'runId');
+        }
       },
     });
   }
@@ -144,14 +157,26 @@ export async function addPosts(
   for (const post of posts) {
     const key: [string, string] = [runId, post.id];
     const existing = await store.get(key);
-    if (existing) continue;
-    const stored: StoredPost = { ...post, runId, windowIndex };
-    await store.put(stored);
-    inserted += 1;
+    const merged = mergePostContext(existing, post);
+    const stored: StoredPost = {
+      ...merged,
+      runId,
+      windowIndex: existing?.windowIndex ?? windowIndex,
+      createdAt: existing?.createdAt ?? post.createdAt,
+    };
+    if (!existing || JSON.stringify(existing) !== JSON.stringify(stored)) await store.put(stored);
+    if (!existing) inserted += 1;
   }
 
   await tx.done;
   return inserted;
+}
+
+export async function getPostFromHistory(id: string): Promise<NormalizedPost | undefined> {
+  const db = await getDB();
+  const posts = await db.getAllFromIndex('posts', 'by-id', id);
+  return posts.sort((a, b) => b.collectedAt.localeCompare(a.collectedAt))
+    .reduce<NormalizedPost | undefined>(mergePostContext, undefined);
 }
 
 export async function getPostsForRun(runId: string): Promise<StoredPost[]> {
@@ -187,9 +212,23 @@ export async function getAnalysesForRun(runId: string): Promise<AiAnalysis[]> {
   return items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
+export async function getSavedTranscript(runId: string, url: string): Promise<Transcription | undefined> {
+  const db = await getDB();
+  return (await db.get('transcripts', [runId, url]))?.transcription;
+}
+
+export async function saveTranscript(runId: string, url: string, transcription: Transcription): Promise<void> {
+  const db = await getDB();
+  const tx = db.transaction(['runs', 'transcripts'], 'readwrite');
+  if (await tx.objectStore('runs').getKey(runId)) {
+    await tx.objectStore('transcripts').put({ runId, url, transcription });
+  }
+  await tx.done;
+}
+
 export async function deleteRun(runId: string): Promise<void> {
   const db = await getDB();
-  const tx = db.transaction(['runs', 'posts', 'analyses'], 'readwrite');
+  const tx = db.transaction(['runs', 'posts', 'analyses', 'transcripts'], 'readwrite');
   await tx.objectStore('runs').delete(runId);
   const postsStore = tx.objectStore('posts');
   const index = postsStore.index('by-run');
@@ -204,17 +243,20 @@ export async function deleteRun(runId: string): Promise<void> {
     await analysisCursor.delete();
     analysisCursor = await analysisCursor.continue();
   }
+  const transcripts = tx.objectStore('transcripts');
+  for (const key of await transcripts.index('by-run').getAllKeys(runId)) await transcripts.delete(key);
   await tx.done;
 }
 
 export async function clearAllData(): Promise<void> {
   const db = await getDB();
-  const tx = db.transaction(['lists', 'runs', 'posts', 'analyses'], 'readwrite');
+  const tx = db.transaction(['lists', 'runs', 'posts', 'analyses', 'transcripts'], 'readwrite');
   await Promise.all([
     tx.objectStore('lists').clear(),
     tx.objectStore('runs').clear(),
     tx.objectStore('posts').clear(),
     tx.objectStore('analyses').clear(),
+    tx.objectStore('transcripts').clear(),
   ]);
   await tx.done;
 }

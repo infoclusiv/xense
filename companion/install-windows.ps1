@@ -3,6 +3,8 @@ param(
   [ValidatePattern('^[a-p]{32}$')]
   [string]$ExtensionId,
   [string]$CodexPath,
+  [string]$WhisperXPath,
+  [string]$WhisperXPython,
   [switch]$Edge
 )
 $ErrorActionPreference = 'Stop'
@@ -14,17 +16,24 @@ if (-not (Test-Path $script)) { throw 'No se encontró companion/host.mjs.' }
 # Chrome on Windows can launch the host via a .cmd wrapper.
 $launcher = Join-Path $folder 'xense-native.cmd'
 $lines = @('@echo off')
-if ($CodexPath) {
-  $resolvedCodex = (Resolve-Path -LiteralPath $CodexPath -ErrorAction Stop).ProviderPath
-  if (-not (Test-Path -LiteralPath $resolvedCodex -PathType Leaf)) {
-    throw 'El ejecutable de Codex seleccionado no existe.'
+if ($WhisperXPath -and $WhisperXPython) { throw 'Selecciona el ejecutable de WhisperX o el Python de su entorno.' }
+function Add-LauncherExecutable([string]$variableName, [string]$pathValue) {
+  $resolved = (Resolve-Path -LiteralPath $pathValue -ErrorAction Stop).ProviderPath
+  if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+    throw 'El ejecutable seleccionado no existe.'
   }
   # The resolved path is inserted into a batch launcher; reject CMD metacharacters.
-  if ($resolvedCodex -match '["%&|<>!^\r\n]') {
+  if ($resolved -match '["%&|<>!^\r\n]') {
     throw 'La ruta del CLI contiene caracteres incompatibles con el lanzador de Windows.'
   }
-  $lines += ('set "XENSE_CODEX_PATH={0}"' -f $resolvedCodex)
+  if ($variableName -like 'XENSE_WHISPERX_*' -and $resolved -notmatch '\.exe$') {
+    throw 'Selecciona whisperx.exe o python.exe del entorno instalado.'
+  }
+  'set "{0}={1}"' -f $variableName, $resolved
 }
+if ($CodexPath) { $lines += Add-LauncherExecutable 'XENSE_CODEX_PATH' $CodexPath }
+if ($WhisperXPath) { $lines += Add-LauncherExecutable 'XENSE_WHISPERX_PATH' $WhisperXPath }
+if ($WhisperXPython) { $lines += Add-LauncherExecutable 'XENSE_WHISPERX_PYTHON' $WhisperXPython }
 $lines += ('"{0}" "{1}"' -f $node, $script)
 [IO.File]::WriteAllLines($launcher, $lines, [Text.Encoding]::ASCII)
 
@@ -45,5 +54,5 @@ Set-Item -Path $key -Value $manifest
 Write-Host 'XENSE_NATIVE_HOST_REGISTERED' -ForegroundColor Green
 Write-Host "Host: $manifest"
 Write-Host "Extension ID: $ExtensionId"
-if ($CodexPath) { Write-Host "Codex seleccionado: $resolvedCodex" }
+if ($CodexPath) { Write-Host "Codex seleccionado: $CodexPath" }
 Write-Host 'Reabre Xense y pulsa Comprobar conexión.'

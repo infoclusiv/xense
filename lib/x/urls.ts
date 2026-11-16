@@ -74,3 +74,22 @@ export function operationFromGraphqlUrl(url: string): string | null {
     return match[1];
   }
 }
+
+export function postIdFromPath(path: string): string | undefined {
+  return /^\/(?:[\w]+|i\/web|i)\/status\/(\d{1,30})(?:\/|$)/.exec(path)?.[1];
+}
+
+export function articleIdFromPath(path: string): string | undefined {
+  return /^\/(?:i|[\w]+)\/article\/(\d{1,30})\/?$/.exec(path)?.[1];
+}
+
+export function postIdFromUrl(input: string): string | undefined {
+  try {
+    const url = new URL(input);
+    return /^(?:www\.)?(?:x|twitter)\.com$/.test(url.hostname)
+      ? postIdFromPath(url.pathname)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
