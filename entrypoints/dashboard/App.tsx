@@ -1,8 +1,8 @@
-import { makeAnalysisPrompts, makeSynthesisPrompt } from '../../lib/ai/analysis';
 import type { AiAnalysis, AiAnalysisType, AiProvider } from '../../lib/ai/analysis';
 import { nativeRequest } from '../../lib/ai/native';
+import { analyzeCollection } from '../../lib/ai/run-analysis';
 import { getAnalysesForRun, saveAnalysis } from '../../lib/db';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatLocalDateTime } from '../../lib/dates/parse';
 import {
   buildAiDigest,
@@ -14,14 +14,19 @@ import {
   downloadTextFile,
   exportBaseName,
 } from '../../lib/export/exporters';
+import { buildInfographicHtml } from '../../lib/export/infographic';
 import type { NormalizedPost, PostType, RunData } from '../../lib/types';
 import {
   bg,
   getErrorMessage,
   isActiveStatus,
+  shortRunDate,
   statusLabel,
   statusTone,
 } from '../../lib/ui/api';
+import InfographicView from './Infographic';
+import CodexModelPicker from './CodexModelPicker';
+import { useCodexModels } from './useCodexModels';
 
 type TypeFilter = 'all' | PostType;
 type SortOrder = 'newest' | 'oldest';
@@ -37,7 +42,15 @@ const TYPE_LABEL: Record<PostType, string> = {
 const MODE_LABEL: Record<string, string> = {
   auto: 'Automático',
   search: 'Solo búsqueda',
-  timeline: 'Solo timeline',
+  list: 'Solo lista',
+  timeline: 'Solo lista (antiguo)',
+};
+
+const ANALYSIS_LABEL: Record<AiAnalysisType, string> = {
+  themes: 'Resumen temático',
+  highlights: 'Publicaciones importantes',
+  trends: 'Tendencias y novedades',
+  custom: 'Instrucciones propias',
 };
 
 export default function App() {
@@ -57,13 +70,20 @@ export default function App() {
   const [aiProvider, setAiProvider] = useState<AiProvider>('chatgpt_codex');
   const [aiType, setAiType] = useState<AiAnalysisType>('themes');
   const [aiPrompt, setAiPrompt] = useState('');
-  const [aiModel, setAiModel] = useState('');
+  const [openCodeModel, setOpenCodeModel] = useState('');
   const [aiHistory, setAiHistory] = useState<AiAnalysis[]>([]);
   const [aiBusy, setAiBusy] = useState(false);
   const [aiProgress, setAiProgress] = useState('');
   const [aiError, setAiError] = useState('');
   const [aiConnection, setAiConnection] = useState('');
-  const [aiResult, setAiResult] = useState<AiAnalysis | null>(null);
+  const [aiSelectedId, setAiSelectedId] = useState('');
+  const [aiStopping, setAiStopping] = useState(false);
+  const aiController = useRef<AbortController | null>(null);
+  const infographicRef = useRef<HTMLElement>(null);
+  const aiResult = aiHistory.find(item => item.id === aiSelectedId) ?? aiHistory[0];
+  const usesCodex = aiProvider === 'chatgpt_codex';
+  const codexModels = useCodexModels(usesCodex && data !== null && !deleted);
+  const modelPreferenceLoading = usesCodex && codexModels.preferred === null;
 
   const load = useCallback(
     async (silent = false) => {
@@ -190,6 +210,7 @@ export default function App() {
   }, [runId]);
 
   useEffect(() => { void loadAiHistory(); }, [loadAiHistory]);
+  useEffect(() => () => aiController.current?.abort(), []);
 
   const checkAiConnection = async () => {
     setAiError('');
@@ -207,56 +228,55 @@ export default function App() {
   };
 
   const analyzeWithAi = async () => {
-    if (!data || aiBusy || !data.posts.length) return;
+    if (!data || aiController.current || !data.posts.length || modelPreferenceLoading) return;
+    const controller = new AbortController();
+    aiController.current = controller;
     setAiBusy(true);
     setAiError('');
-    setAiProgress('Preparando los tweets…');
+    setAiProgress('Preparando las publicaciones…');
     try {
-      const built = makeAnalysisPrompts(data.posts, aiType, aiPrompt);
-      if (!built.prompts.length) throw new Error('No hay tweets para analizar.');
-      const partials: string[] = [];
-      for (let index = 0; index < built.prompts.length; index++) {
-        setAiProgress('Analizando lote ' + (index + 1) + ' de ' + built.prompts.length + '…');
-        const response = await nativeRequest({
-          type: 'ANALYZE',
-          provider: aiProvider,
-          model: aiModel.trim(),
-          prompt: built.prompts[index],
-        });
-        if (!response.text) throw new Error('El proveedor no devolvió un resultado.');
-        partials.push(response.text);
-      }
-      let result = partials[0]!;
-      if (partials.length > 1) {
-        setAiProgress('Consolidando los análisis parciales…');
-        const consolidated = await nativeRequest({
-          type: 'ANALYZE', provider: aiProvider, model: aiModel.trim(),
-          prompt: makeSynthesisPrompt(partials, aiType),
-        });
-        if (!consolidated.text) throw new Error('No se pudo consolidar el análisis.');
-        result = consolidated.text;
-      }
-      const analysis: AiAnalysis = {
-        id: crypto.randomUUID(), runId, createdAt: new Date().toISOString(),
-        provider: aiProvider, model: aiModel.trim(), kind: aiType,
-        prompt: aiType === 'custom' ? aiPrompt.trim() : '',
-        result, processedPosts: built.processed, skippedPosts: built.skipped,
-        chunkCount: built.prompts.length,
-      };
+      const analysis = await analyzeCollection(data, {
+        provider: aiProvider,
+        model: usesCodex ? codexModels.model : openCodeModel,
+        kind: aiType,
+        instruction: aiPrompt,
+        signal: controller.signal,
+        onProgress: setAiProgress,
+      });
+      controller.signal.throwIfAborted();
       await saveAnalysis(analysis);
-      setAiResult(analysis);
-      await loadAiHistory();
-      setAiProgress('Análisis guardado.');
+      setAiHistory(items => [analysis, ...items]);
+      setAiSelectedId(analysis.id);
+      setAiProgress('Infografía guardada.');
     } catch (error) {
-      setAiError(getErrorMessage(error));
-      setAiProgress('');
+      if (controller.signal.aborted) {
+        setAiProgress('Análisis detenido.');
+      } else {
+        setAiError(getErrorMessage(error));
+        setAiProgress('');
+      }
     } finally {
+      aiController.current = null;
+      setAiStopping(false);
       setAiBusy(false);
     }
   };
 
+  const stopAnalysis = () => {
+    aiController.current?.abort();
+    setAiStopping(true);
+    setAiProgress('Deteniendo el análisis al terminar la consulta en curso…');
+  };
+
+  const downloadInfographic = () => {
+    const article = infographicRef.current;
+    if (!article || !aiResult || !data) return;
+    const filename = `${exportBaseName(data)}-infografia-${aiResult.id.slice(0, 8)}.html`;
+    downloadTextFile(filename, buildInfographicHtml(article), 'text/html');
+  };
+
   const handleDelete = async () => {
-    if (!runId) return;
+    if (!runId || aiController.current) return;
     if (
       !window.confirm(
         '¿Eliminar esta recolección y todos sus posts guardados? Esta acción no se puede deshacer.',
@@ -446,86 +466,97 @@ export default function App() {
             </div>
           </div>
           <p className="hint">
-            Usa una sesión de Codex CLI (ChatGPT) u OpenCode CLI ya autorizada en Windows.
-            Los tweets se envían al modelo elegido. Esta etapa utiliza CLI, no OAuth directo.
+            Genera una infografía con los hallazgos y los gráficos de toda la recolección.
+            Las publicaciones se envían al proveedor que selecciones mediante el CLI instalado en Windows.
           </p>
-          <div className="form-grid" style={{ display: 'grid', gap: 12, marginTop: 14, marginBottom: 14 }}>
+          <div className="ai-form">
             <label>
               Proveedor
-              <select value={aiProvider} disabled={aiBusy}
+              <select className="input" value={aiProvider} disabled={aiBusy}
                 onChange={event => { setAiProvider(event.target.value as AiProvider); setAiConnection(''); }}>
                 <option value="chatgpt_codex">ChatGPT (Codex CLI)</option>
                 <option value="opencode">OpenCode CLI</option>
               </select>
             </label>
-            <label>
-              Modelo (opcional: vacío usa el predeterminado del CLI)
-              <input value={aiModel} disabled={aiBusy} placeholder="Modelo predeterminado"
-                onChange={event => setAiModel(event.target.value)} />
-            </label>
+            {usesCodex ? (
+              <CodexModelPicker catalog={codexModels} disabled={aiBusy} />
+            ) : (
+              <label>
+                Modelo (opcional)
+                <input className="input" value={openCodeModel} disabled={aiBusy} placeholder="Predeterminado del CLI"
+                  onChange={event => setOpenCodeModel(event.target.value)} />
+              </label>
+            )}
             <label>
               Tipo de análisis
-              <select value={aiType} disabled={aiBusy}
+              <select className="input" value={aiType} disabled={aiBusy}
                 onChange={event => setAiType(event.target.value as AiAnalysisType)}>
-                <option value="themes">Resumen temático</option>
-                <option value="highlights">Publicaciones importantes</option>
-                <option value="trends">Tendencias y novedades</option>
-                <option value="custom">Instrucciones propias</option>
+                {Object.entries(ANALYSIS_LABEL).map(([value, label]) => (
+                  <option key={value} value={value}>{label}</option>
+                ))}
               </select>
             </label>
             {aiType === 'custom' && (
-              <label>
+              <label className="ai-instruction">
                 Instrucciones para el análisis
-                <textarea value={aiPrompt} disabled={aiBusy} rows={4}
+                <textarea className="input" value={aiPrompt} disabled={aiBusy} rows={4} maxLength={3000}
                   onChange={event => setAiPrompt(event.target.value)}
                   placeholder="Describe qué quieres identificar en las publicaciones" />
               </label>
             )}
           </div>
-          <div className="button-row" style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          <div className="button-row">
+            <button className="btn btn-primary" disabled={aiBusy || !data.posts.length || modelPreferenceLoading}
+              onClick={() => void analyzeWithAi()}>
+              {aiBusy ? 'Analizando…' : 'Generar infografía'}
+            </button>
             <button className="btn btn-secondary" disabled={aiBusy} onClick={() => void checkAiConnection()}>
               Comprobar conexión
             </button>
-            <button className="btn btn-primary" disabled={aiBusy || !data.posts.length}
-              onClick={() => void analyzeWithAi()}>
-              {aiBusy ? 'Analizando…' : 'Analizar publicaciones'}
-            </button>
+            {aiBusy && (
+              <button className="btn btn-ghost" disabled={aiStopping} onClick={stopAnalysis}>
+                Detener
+              </button>
+            )}
           </div>
           {aiConnection && <p className="hint" role="status">{aiConnection}</p>}
           {aiProgress && <p className="hint" role="status">{aiProgress}</p>}
           {aiError && <p className="field-error" role="alert">{aiError}</p>}
-          {(aiResult || aiHistory.length > 0) && (
-            <div style={{ marginTop: 16 }}>
-              <h3>Informes guardados</h3>
-              <select aria-label="Seleccionar informe" value={aiResult?.id ?? ''}
-                onChange={event => setAiResult(aiHistory.find(item => item.id === event.target.value) ?? null)}>
-                <option value="">Selecciona un informe anterior</option>
-                {aiHistory.map(item => (
-                  <option key={item.id} value={item.id}>
-                    {new Date(item.createdAt).toLocaleString('es')} · {item.provider} · {item.kind}
-                  </option>
-                ))}
-              </select>
-              {aiResult && (
-                <div>
+          {aiResult && (
+            <div className="ai-output">
+              <div className="ai-output-bar">
+                <label>
+                  Análisis guardados
+                  <select className="input" value={aiResult.id} onChange={event => setAiSelectedId(event.target.value)}>
+                    {aiHistory.map(item => (
+                      <option key={item.id} value={item.id}>
+                        {shortRunDate(item.createdAt, timezone)} · {item.infographic?.title ?? ANALYSIS_LABEL[item.kind]}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <div className="button-row">
+                  {aiResult.infographic && (
+                    <button className="btn btn-secondary" onClick={downloadInfographic}>
+                      Descargar HTML
+                    </button>
+                  )}
+                  <button className="btn btn-ghost" onClick={() =>
+                    downloadTextFile('xense-analisis-' + aiResult.id + '.md', aiResult.result, 'text/markdown')}>
+                    Descargar Markdown
+                  </button>
+                </div>
+              </div>
+              {aiResult.infographic ? (
+                <InfographicView report={aiResult.infographic} analysis={aiResult} articleRef={infographicRef} />
+              ) : (
+                <>
                   <p className="hint">
-                    {aiResult.processedPosts} posts analizados · {aiResult.skippedPosts} omitidos
+                    {aiResult.processedPosts} publicaciones analizadas · {aiResult.skippedPosts} omitidas
                     · {aiResult.chunkCount} lotes
                   </p>
-                  {aiResult.skippedPosts > 0 && (
-                    <p className="field-error">La cantidad excedió el límite de esta versión.
-                      El informe no incluye todos los posts.</p>
-                  )}
-                  <div className="button-row">
-                    <button className="btn btn-secondary" onClick={() =>
-                      downloadTextFile('xense-analisis-' + aiResult.id + '.md', aiResult.result, 'text/markdown')}>
-                      Descargar Markdown
-                    </button>
-                  </div>
-                  <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', marginTop: 12 }}>
-                    {aiResult.result}
-                  </pre>
-                </div>
+                  <pre className="ai-legacy-result">{aiResult.result}</pre>
+                </>
               )}
             </div>
           )}
@@ -756,7 +787,7 @@ export default function App() {
             Borra esta recolección y sus {stats.total.toLocaleString('es')} posts de IndexedDB en
             este navegador. No afecta a tu cuenta de X.
           </p>
-          <button className="btn btn-danger" onClick={() => void handleDelete()}>
+          <button className="btn btn-danger" disabled={aiBusy} onClick={() => void handleDelete()}>
             Eliminar recolección
           </button>
         </section>

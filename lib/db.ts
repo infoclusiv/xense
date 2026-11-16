@@ -172,7 +172,13 @@ export async function getNewestPostForRun(runId: string): Promise<StoredPost | u
 
 export async function saveAnalysis(analysis: AiAnalysis): Promise<void> {
   const db = await getDB();
-  await db.put('analyses', analysis);
+  const tx = db.transaction(['runs', 'analyses'], 'readwrite');
+  if (!await tx.objectStore('runs').getKey(analysis.runId)) {
+    await tx.done;
+    throw new Error('La recolección se eliminó antes de guardar el análisis.');
+  }
+  await tx.objectStore('analyses').put(analysis);
+  await tx.done;
 }
 
 export async function getAnalysesForRun(runId: string): Promise<AiAnalysis[]> {

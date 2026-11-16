@@ -1434,6 +1434,73 @@ select.input {
   flex: 0 1 auto;
 }
 
+.ai-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 205px), 1fr));
+  align-items: start;
+  gap: 12px;
+  margin: 14px 0;
+}
+
+.ai-form label,
+.ai-output-bar label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.ai-instruction {
+  grid-column: 1 / -1;
+}
+
+.ai-form .input,
+.ai-output-bar .input {
+  min-width: 0;
+  color: var(--text);
+  font-weight: 400;
+}
+
+.ai-model-picker {
+  min-width: 0;
+}
+
+.ai-model-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.ai-output {
+  margin-top: 18px;
+}
+
+.ai-output-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.ai-output-bar label {
+  flex: 1 1 260px;
+  max-width: 480px;
+}
+
+.ai-output-bar .button-row {
+  margin: 0;
+}
+
+.ai-legacy-result {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .dash-columns {
   display: grid;
   grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);

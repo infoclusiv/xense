@@ -1,3 +1,5 @@
+import type { WindowMode } from '../types';
+
 const LIST_ID_PATTERNS = [
   /(?:^|\/)i\/lists\/(\d+)/i,
   /(?:^|\/)lists\/(\d+)/i,
@@ -42,9 +44,25 @@ export function buildWindowUrl(
   listId: string,
   startIso: string,
   endIso: string,
-  mode: 'search' | 'timeline',
+  mode: WindowMode | 'timeline',
 ): string {
-  return mode === 'timeline' ? buildListUrl(listId) : buildSearchUrl(listId, startIso, endIso);
+  return mode === 'search' ? buildSearchUrl(listId, startIso, endIso) : buildListUrl(listId);
+}
+
+export function matchesWindowUrl(actual: string | undefined, expected: string): boolean {
+  if (!actual) return false;
+  try {
+    const url = new URL(actual);
+    const target = new URL(expected);
+    if (url.origin !== 'https://x.com' && url.origin !== 'https://twitter.com') return false;
+    if (url.pathname.replace(/\/+$/, '') !== target.pathname) return false;
+    return target.pathname !== '/search' || (
+      url.searchParams.get('q') === target.searchParams.get('q') &&
+      url.searchParams.get('f') === target.searchParams.get('f')
+    );
+  } catch {
+    return false;
+  }
 }
 
 export function operationFromGraphqlUrl(url: string): string | null {

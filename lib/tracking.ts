@@ -18,6 +18,9 @@ const UNCOVERED_REASONS = new Set([
   'max_posts',
   'cancelled',
   'skipped_limit',
+  'stalled',
+  'list_incomplete',
+  'list_failed',
 ]);
 
 export class TrackingError extends Error {

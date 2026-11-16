@@ -8,7 +8,9 @@ export type RunStatus =
   | 'failed'
   | 'cancelled';
 
-export type RunMode = 'auto' | 'search' | 'timeline';
+export type RunMode = 'auto' | 'list' | 'search';
+export type RunStrategy = 'list' | 'search';
+export type HumanizeLevel = 'off' | 'light' | 'balanced' | 'careful';
 export type RunOrigin = 'manual' | 'continuation';
 
 export interface LastCapturedPost {
@@ -39,7 +41,7 @@ export interface TrackingStore {
   version: 1;
   lists: Record<string, ListTracking>;
 }
-export type WindowMode = 'search' | 'timeline';
+export type WindowMode = 'search' | 'list';
 export type WindowStatus = 'pending' | 'active' | 'done' | 'failed';
 export type PostType = 'original' | 'reply' | 'quote' | 'repost';
 
@@ -78,6 +80,9 @@ export interface ScrapeConfig {
   maxDelayMs: number;
   idleScrolls: number;
   maxScrolls: number;
+  manualScroll?: boolean;
+  humanizeLevel: HumanizeLevel;
+  blankClicks: boolean;
   origin?: RunOrigin;
   continuationOfRunId?: string;
 }
@@ -119,6 +124,10 @@ export interface RunRecord {
   finishedAt?: string;
   status: RunStatus;
   config: ScrapeConfig;
+  /** Cómo se está recorriendo el rango. Los runs antiguos sin campo se tratan como búsqueda. */
+  strategy?: RunStrategy;
+  /** El recorrido de lista no llegó al inicio y se está buscando el tramo pendiente. */
+  fallbackStarted?: boolean;
   windows: RunWindow[];
   currentWindowIndex: number;
   tabId?: number;
@@ -200,6 +209,9 @@ export interface Settings {
   maxDelayMs: number;
   idleScrolls: number;
   maxScrolls: number;
+  manualScroll: boolean;
+  humanizeLevel: HumanizeLevel;
+  blankClicks: boolean;
 }
 
 export type RunSummaryStatus = RunStatus;
@@ -259,6 +271,8 @@ export interface ContentContext {
   windowStart: string;
   windowEnd: string;
   windowMode: WindowMode;
+  expectedUrl: string;
+  strategy: RunStrategy;
   paused: boolean;
   includeReplies: boolean;
   includeReposts: boolean;
@@ -268,6 +282,9 @@ export interface ContentContext {
   maxDelayMs: number;
   idleScrolls: number;
   maxScrolls: number;
+  manualScroll: boolean;
+  humanizeLevel: HumanizeLevel;
+  blankClicks: boolean;
   alreadyCaptured: number;
 }
 
@@ -284,10 +301,22 @@ export type ContentToBackgroundMessage =
       scrolls: number;
       windowCaptured: number;
       oldestSeenAt: string | null;
+      /** Fecha más antigua confirmada al recorrer la lista (todo lo posterior ya se vio). */
+      coveredUntilAt?: string | null;
       pageHasResults: boolean;
       hidden: boolean;
       phase: RunProgress['phase'];
       message: string;
+    }
+  | {
+      type: 'LIST_PASS_DONE';
+      reason: string;
+      message: string;
+      scrolls: number;
+      captured: number;
+      oldestSeenAt: string | null;
+      coveredUntilAt: string | null;
+      reachedStart: boolean;
     }
   | {
       type: 'WINDOW_DONE';

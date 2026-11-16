@@ -375,6 +375,9 @@ export default function App() {
         maxDelayMs: settings.maxDelayMs,
         idleScrolls: settings.idleScrolls,
         maxScrolls: settings.maxScrolls,
+        manualScroll: settings.manualScroll,
+        humanizeLevel: settings.humanizeLevel,
+        blankClicks: settings.blankClicks,
       };
       const response = isContinuation
         ? await bg<{ run: RunRecord }>('START_CONTINUE_RUN', { config: base })
@@ -385,8 +388,8 @@ export default function App() {
       setLatestRun(response.run);
       notify(
         'success',
-        isContinuation
-          ? 'Recolección de novedades iniciada. La pestaña de X está trabajando.'
+        settings.manualScroll
+          ? 'Recolección iniciada. Desplázate en la pestaña de X para cargar más posts.'
           : 'Recolección iniciada. La pestaña de X está trabajando.',
       );
       void refreshState();
@@ -661,8 +664,8 @@ export default function App() {
 
                 {waitingLists && (
                   <p className="hint waiting-hint">
-                    <span className="spinner small" /> Se abrió x.com/i/lists. Esperando a que carguen
-                    tus listas…
+                    <span className="spinner small" /> Desplázate en x.com/i/lists si tienes más
+                    listas por cargar.
                   </p>
                 )}
 
@@ -893,25 +896,62 @@ export default function App() {
                       ? 'Automático'
                       : settings.mode === 'search'
                         ? 'Solo búsqueda'
-                        : 'Solo timeline'}
+                        : 'Solo lista'}
                   </span>
                 </summary>
-                <div className="form-row">
-                  <label>
-                    Modo
-                    <select
-                      className="input"
-                      value={settings.mode}
-                      onChange={(event) =>
-                        updateSettings({ mode: event.target.value as Settings['mode'] })
-                      }
-                    >
-                      <option value="auto">Automático (búsqueda + timeline)</option>
-                      <option value="search">Solo búsqueda por fechas</option>
-                      <option value="timeline">Solo timeline de la lista</option>
-                    </select>
-                  </label>
-                </div>
+                <label className="field-label">
+                  Modo de recorrido
+                  <select
+                    className="input"
+                    value={settings.mode}
+                    onChange={(event) =>
+                      updateSettings({ mode: event.target.value as Settings['mode'] })
+                    }
+                  >
+                    <option value="auto">Automático (lista reciente + búsqueda si no alcanza)</option>
+                    <option value="list">Solo lista (sin búsqueda de respaldo)</option>
+                    <option value="search">Solo búsqueda por fechas</option>
+                  </select>
+                </label>
+                <label className="field-label">
+                  Humanización
+                  <select
+                    className="input"
+                    value={settings.humanizeLevel}
+                    onChange={(event) =>
+                      updateSettings({
+                        humanizeLevel: event.target.value as Settings['humanizeLevel'],
+                      })
+                    }
+                  >
+                    <option value="off">Desactivada (rápida)</option>
+                    <option value="light">Ligera</option>
+                    <option value="balanced">Equilibrada</option>
+                    <option value="careful">Cuidadosa</option>
+                  </select>
+                </label>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={settings.blankClicks}
+                    onChange={(event) => updateSettings({ blankClicks: event.target.checked })}
+                  />
+                  <span>Clics en zonas vacías</span>
+                </label>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={settings.manualScroll}
+                    onChange={(event) => updateSettings({ manualScroll: event.target.checked })}
+                  />
+                  <span>Desplazamiento manual</span>
+                </label>
+                {settings.manualScroll && (
+                  <p className="hint">
+                    Desplázate en la pestaña de X. Xense guardará los posts que se carguen. La
+                    humanización automática y los clics se desactivan en este modo.
+                  </p>
+                )}
                 <div className="toggle-grid">
                   <label className="toggle">
                     <input
@@ -1248,7 +1288,11 @@ function ActiveRunPanel({
       </div>
       <div className="progress-caption">
         <span>
-          Ventana {run.currentWindowIndex + 1} de {run.windows.length}
+          {run.strategy === 'list'
+            ? run.fallbackStarted
+              ? 'Buscando los días que faltan'
+              : 'Recorrido de lista'
+            : `Ventana ${run.currentWindowIndex + 1} de ${run.windows.length}`}
         </span>
         <span>{progress}%</span>
       </div>
@@ -1271,12 +1315,25 @@ function ActiveRunPanel({
       </div>
 
       <p className="run-message">{run.progress.message}</p>
-      {window && (
+      {run.strategy === 'list' || run.fallbackStarted ? (
         <p className="hint">
-          Ventana actual: {formatLocalDateTime(window.start, run.config.range.timezone)} →{' '}
-          {formatLocalDateTime(window.end, run.config.range.timezone)} · {run.progress.scrolls}{' '}
-          desplazamientos
+          Objetivo: {formatLocalDateTime(run.config.range.start, run.config.range.timezone)}
+          {' · '}
+          Confirmado hasta:{' '}
+          {run.progress.oldestSeenAt
+            ? formatLocalDateTime(run.progress.oldestSeenAt, run.config.range.timezone)
+            : 'todavía no hay datos'}
+          {' · '}
+          {run.progress.scrolls} pasos
         </p>
+      ) : (
+        window && (
+          <p className="hint">
+            Ventana actual: {formatLocalDateTime(window.start, run.config.range.timezone)} →{' '}
+            {formatLocalDateTime(window.end, run.config.range.timezone)} · {run.progress.scrolls}{' '}
+            desplazamientos
+          </p>
+        )
       )}
       {run.progress.hidden && (
         <div className="inline-warning">
@@ -1293,13 +1350,15 @@ function ActiveRunPanel({
       )}
 
       <div className="button-row">
-        <button
-          className="btn btn-secondary"
-          onClick={onPauseResume}
-          disabled={Boolean(busy) || (run.status !== 'running' && run.status !== 'paused')}
-        >
-          {run.status === 'paused' ? 'Reanudar' : 'Pausar'}
-        </button>
+        {!run.config.manualScroll && (
+          <button
+            className="btn btn-secondary"
+            onClick={onPauseResume}
+            disabled={Boolean(busy) || (run.status !== 'running' && run.status !== 'paused')}
+          >
+            {run.status === 'paused' ? 'Reanudar' : 'Pausar'}
+          </button>
+        )}
         <button className="btn btn-ghost danger-text" onClick={onCancel} disabled={Boolean(busy)}>
           Detener
         </button>
@@ -1442,11 +1501,49 @@ function SettingsPanel({
             value={settings.mode}
             onChange={(event) => updateSettings({ mode: event.target.value as Settings['mode'] })}
           >
-            <option value="auto">Automático: búsqueda y, si falla, timeline</option>
+            <option value="auto">Automático: lista reciente y búsqueda de respaldo</option>
+            <option value="list">Solo lista: recorrer el timeline sin búsqueda</option>
             <option value="search">Solo búsqueda por fechas</option>
-            <option value="timeline">Solo timeline de la lista</option>
           </select>
         </label>
+        <p className="hint">
+          En automático, si el rango es reciente (empieza en los últimos 30 días y termina como
+          mucho 2 días antes de ahora) se recorre la lista como lo haría una persona. Si el
+          recorrido no alcanza el inicio, se buscan solo los días que faltan. Los rangos más
+          antiguos usan búsqueda por días.
+        </p>
+
+        <label className="field-label">
+          Humanización
+          <select
+            className="input"
+            value={settings.humanizeLevel}
+            onChange={(event) =>
+              updateSettings({
+                humanizeLevel: event.target.value as Settings['humanizeLevel'],
+              })
+            }
+          >
+            <option value="off">Desactivada (rápida)</option>
+            <option value="light">Ligera</option>
+            <option value="balanced">Equilibrada</option>
+            <option value="careful">Cuidadosa</option>
+          </select>
+        </label>
+        <label className="toggle">
+          <input
+            type="checkbox"
+            checked={settings.blankClicks}
+            onChange={(event) => updateSettings({ blankClicks: event.target.checked })}
+          />
+          <span>Clics en zonas vacías</span>
+        </label>
+        <p className="hint">
+          Añade pausas, velocidad variable, movimiento del puntero y clics en zonas inertes. Un
+          clic solo se envía después de comprobar que no hay enlaces, botones, posts, diálogos,
+          selecciones ni controles; si hay cualquier duda, no se hace clic. Los eventos son
+          sintéticos y nunca se usan en desplazamiento manual.
+        </p>
 
         <div className="toggle-grid">
           <label className="toggle">

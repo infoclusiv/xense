@@ -3,6 +3,8 @@ node_modules/
 .output/
 dist/
 coverage/
+/companion/com.infoclusiv.xense.json
+/companion/xense-native.cmd
 *.zip
 .env
 .env.*

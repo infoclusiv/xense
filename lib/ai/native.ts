@@ -2,11 +2,17 @@ import type { AiProvider } from './analysis';
 
 export const XENSE_NATIVE_HOST = 'com.infoclusiv.xense';
 
+export interface AiModelOption {
+  id: string;
+  label: string;
+}
+
 export interface NativeReply {
   ok: boolean;
   error?: string;
   text?: string;
   version?: string;
+  models?: AiModelOption[];
   providers?: Record<AiProvider, { installed: boolean; label: string; version?: string }>;
 }
 

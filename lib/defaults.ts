@@ -1,4 +1,4 @@
-import type { Settings } from './types';
+import type { HumanizeLevel, Settings } from './types';
 
 export const BROWSER_TIMEZONE =
   (() => {
@@ -20,6 +20,9 @@ export const DEFAULT_SETTINGS: Settings = {
   maxDelayMs: 4200,
   idleScrolls: 8,
   maxScrolls: 150,
+  manualScroll: false,
+  humanizeLevel: 'balanced',
+  blankClicks: true,
 };
 
 export const MAX_RANGE_DAYS = 180;
@@ -33,13 +36,34 @@ export function clampSettings(input: Partial<Settings> | undefined, fallback: Se
   return {
     ...merged,
     timezone: typeof merged.timezone === 'string' && merged.timezone ? merged.timezone : fallback.timezone,
-    mode: merged.mode === 'search' || merged.mode === 'timeline' ? merged.mode : 'auto',
+    mode: normalizeMode(merged.mode),
     maxPosts: clampNumber(merged.maxPosts, 50, MAX_STORED_POSTS_PER_RUN, fallback.maxPosts),
     minDelayMs: clampNumber(merged.minDelayMs, 1000, 15000, fallback.minDelayMs),
     maxDelayMs: clampNumber(merged.maxDelayMs, 1200, 20000, fallback.maxDelayMs),
     idleScrolls: clampNumber(merged.idleScrolls, 3, 40, fallback.idleScrolls),
     maxScrolls: clampNumber(merged.maxScrolls, 10, 1000, fallback.maxScrolls),
+    manualScroll: merged.manualScroll === true,
+    humanizeLevel: normalizeHumanizeLevel(merged.humanizeLevel, fallback.humanizeLevel),
+    blankClicks:
+      typeof merged.blankClicks === 'boolean' ? merged.blankClicks : fallback.blankClicks,
   };
+}
+
+function normalizeMode(value: unknown): Settings['mode'] {
+  // “timeline” era el nombre antiguo del recorrido de lista.
+  if (value === 'search' || value === 'list' || value === 'timeline') {
+    return value === 'timeline' ? 'list' : value;
+  }
+  return 'auto';
+}
+
+export function normalizeHumanizeLevel(
+  value: unknown,
+  fallback: HumanizeLevel = 'balanced',
+): HumanizeLevel {
+  return value === 'off' || value === 'light' || value === 'balanced' || value === 'careful'
+    ? value
+    : fallback;
 }
 
 function clampNumber(value: unknown, min: number, max: number, fallback: number): number {

@@ -9,10 +9,21 @@ declare global {
 
 const SOURCE = 'xense-page';
 
-function shouldForward(operation: string | null): boolean {
-  if (!operation) return false;
-  const lower = operation.toLowerCase();
-  return lower.includes('searchtimeline') || lower.includes('list');
+function readOperation(method: string, requestUrl: string): string | null {
+  if (method.toUpperCase() !== 'GET') return null;
+  const url = new URL(requestUrl, location.href);
+  if (url.origin !== 'https://x.com' && url.origin !== 'https://twitter.com') return null;
+  const operation = operationFromGraphqlUrl(url.pathname);
+  const lower = operation?.toLowerCase();
+  if (!lower) return null;
+
+  const path = location.pathname.replace(/\/+$/, '');
+  if (lower.includes('searchtimeline')) {
+    const query = new URLSearchParams(location.search).get('q') ?? '';
+    return path === '/search' && /^list:\d+\s/i.test(query) ? operation : null;
+  }
+  const isListPage = /^\/i\/lists(?:\/\d+)?$/.test(path) || /^\/[^/]+\/lists$/.test(path);
+  return isListPage && lower.includes('list') ? operation : null;
 }
 
 function hasTweetTimeline(operation: string): boolean {
@@ -20,18 +31,24 @@ function hasTweetTimeline(operation: string): boolean {
   return lower.includes('searchtimeline') || (lower.includes('list') && lower.includes('timeline'));
 }
 
+function reportRateLimit(operation: string): void {
+  if (hasTweetTimeline(operation)) {
+    window.postMessage({ source: SOURCE, kind: 'rate_limited', operation }, location.origin);
+  }
+}
+
 function forward(operation: string, data: unknown): void {
   try {
     if (hasTweetTimeline(operation)) {
       const posts = extractTweetsFromPayload(data);
       if (posts.length > 0) {
-        window.postMessage({ source: SOURCE, kind: 'tweets', operation, posts }, '*');
+        window.postMessage({ source: SOURCE, kind: 'tweets', operation, posts }, location.origin);
       }
     }
     if (operation.toLowerCase().includes('list')) {
       const lists = extractListsFromPayload(data);
       if (lists.length > 0) {
-        window.postMessage({ source: SOURCE, kind: 'lists', operation, lists }, '*');
+        window.postMessage({ source: SOURCE, kind: 'lists', operation, lists }, location.origin);
       }
     }
   } catch (error) {
@@ -55,17 +72,17 @@ export default defineContentScript({
     window.__xenseHookInstalled = true;
 
     const originalFetch = window.fetch;
-    window.fetch = async (...args: Parameters<typeof fetch>): Promise<Response> => {
-      const response = await originalFetch.apply(window, args);
+    window.fetch = (...args: Parameters<typeof fetch>): Promise<Response> => {
+      const result = originalFetch.apply(window, args);
       try {
-        const url = requestUrl(args[0]);
-        const operation = operationFromGraphqlUrl(url);
-        if (shouldForward(operation) && response.ok) {
-          response
-            .clone()
-            .json()
-            .then((data: unknown) => {
-              if (operation) forward(operation, data);
+        const [input, init] = args;
+        const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
+        const operation = readOperation(method, requestUrl(input));
+        if (operation) {
+          void result
+            .then(async (response) => {
+              if (response.status === 429) reportRateLimit(operation);
+              if (response.ok) forward(operation, await response.clone().json());
             })
             .catch(() => {
               // Algunas respuestas no son JSON o el body ya se consumió.
@@ -74,31 +91,38 @@ export default defineContentScript({
       } catch {
         // Nunca interrumpir la aplicación de X por un fallo de captura.
       }
-      return response;
+      return result;
     };
 
     try {
-      const xhrPrototype = XMLHttpRequest.prototype as any;
+      const xhrPrototype = XMLHttpRequest.prototype;
       const originalOpen = xhrPrototype.open;
-      const originalSend = xhrPrototype.send;
+      const observed = new WeakMap<XMLHttpRequest, string | null>();
 
-      xhrPrototype.open = function (method: string, url: string | URL, ...rest: any[]) {
-        this.__xenseUrl = String(url);
-        return originalOpen.call(this, method, url, ...rest);
-      };
+      xhrPrototype.open = function (this: XMLHttpRequest, method: string, url: string | URL, ...rest: unknown[]) {
+        Reflect.apply(originalOpen, this, [method, url, ...rest]);
+        try {
+          const operation = readOperation(method, String(url));
+          const alreadyListening = observed.has(this);
+          if (!operation && !alreadyListening) return;
+          observed.set(this, operation);
+          if (alreadyListening) return;
 
-      xhrPrototype.send = function (...args: any[]) {
-        this.addEventListener('load', () => {
-          try {
-            const operation = operationFromGraphqlUrl(String(this.__xenseUrl ?? ''));
-            if (!shouldForward(operation) || this.status < 200 || this.status >= 300) return;
-            const data = JSON.parse(this.responseText);
-            if (operation) forward(operation, data);
-          } catch {
-            // Respuesta no JSON o inaccesible.
-          }
-        });
-        return originalSend.apply(this, args);
+          this.addEventListener('load', () => {
+            const operation = observed.get(this);
+            if (!operation) return;
+            try {
+              if (this.status === 429) reportRateLimit(operation);
+              if (this.status < 200 || this.status >= 300) return;
+              const data = this.responseType === 'json' ? this.response : JSON.parse(this.responseText);
+              forward(operation, data);
+            } catch {
+              // Respuesta no JSON o inaccesible.
+            }
+          });
+        } catch {
+          observed.set(this, null);
+        }
       };
     } catch (error) {
       console.warn('[Xense] No se pudo instalar el interceptor de XHR.', error);

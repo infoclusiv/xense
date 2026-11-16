@@ -67,6 +67,8 @@ function makeRun(): RunRecord {
       maxDelayMs: 4200,
       idleScrolls: 8,
       maxScrolls: 150,
+      humanizeLevel: 'off',
+      blankClicks: false,
     },
     windows: [
       {

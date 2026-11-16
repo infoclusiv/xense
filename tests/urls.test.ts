@@ -5,6 +5,7 @@ import {
   buildSearchUrl,
   buildWindowUrl,
   extractListId,
+  matchesWindowUrl,
   operationFromGraphqlUrl,
 } from '../lib/x/urls';
 
@@ -57,6 +58,22 @@ describe('URLs de búsqueda', () => {
 
   it('rechaza fechas inválidas', () => {
     expect(() => buildSearchQuery('42', 'no-es-fecha', end)).toThrow();
+  });
+
+  it('solo acepta la consulta y la vista asignadas a la recolección', () => {
+    const target = buildSearchUrl('42', start, end);
+    expect(matchesWindowUrl(target.replace('x.com', 'twitter.com') + '&s=20', target)).toBe(true);
+    expect(matchesWindowUrl(buildSearchUrl('43', start, end), target)).toBe(false);
+    expect(matchesWindowUrl(target.replace('&f=live', ''), target)).toBe(false);
+    expect(matchesWindowUrl('https://x.com/home', target)).toBe(false);
+  });
+
+  it('solo acepta el timeline de la lista asignada en X', () => {
+    const target = buildListUrl('42');
+    expect(matchesWindowUrl(`${target}/?s=20`, target)).toBe(true);
+    expect(matchesWindowUrl(`${target}/members`, target)).toBe(false);
+    expect(matchesWindowUrl(buildListUrl('43'), target)).toBe(false);
+    expect(matchesWindowUrl(target.replace('x.com', 'x.com.example'), target)).toBe(false);
   });
 });
 

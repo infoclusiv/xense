@@ -4,6 +4,7 @@ import {
   MAX_STORED_POSTS_PER_RUN,
   SETTINGS_KEY,
   clampSettings,
+  normalizeHumanizeLevel,
 } from '../lib/defaults';
 import {
   addPosts,
@@ -28,6 +29,7 @@ import {
   buildContinuationRange,
   buildTrackingFromRuns,
   computeCoverageEnd,
+  isWindowCovered,
   toLastCapturedPost,
 } from '../lib/tracking';
 import type {
@@ -42,6 +44,7 @@ import type {
   RunData,
   RunMode,
   RunRecord,
+  RunStrategy,
   RunWindow,
   ScrapeConfig,
   Settings,
@@ -49,7 +52,15 @@ import type {
   TrackingStore,
 } from '../lib/types';
 import { ACTIVE_RUN_STATUSES } from '../lib/types';
-import { buildListUrl, buildWindowUrl, extractListId } from '../lib/x/urls';
+import {
+  buildWindows,
+  findWindowIndex,
+  firstPendingWindowIndex,
+  listPassCoveredIndices,
+  nextPendingWindowIndex,
+  resolveStartStrategy,
+} from '../lib/x/strategy';
+import { buildListUrl, buildWindowUrl, extractListId, matchesWindowUrl } from '../lib/x/urls';
 
 const ACTIVE_RUN_KEY = 'xense.activeRunId';
 const LAST_LIST_KEY = 'xense.lastListId';
@@ -246,8 +257,9 @@ async function getActiveRun(): Promise<RunRecord | null> {
 }
 
 async function getRunForSender(sender: chrome.runtime.MessageSender): Promise<RunRecord | null> {
+  if (sender.frameId !== 0 || !sender.tab?.id) return null;
   const run = await getActiveRun();
-  if (!run || !sender.tab?.id || sender.tab.id !== run.tabId) return null;
+  if (!run || sender.tab.id !== run.tabId) return null;
   return run;
 }
 
@@ -294,8 +306,7 @@ function sanitizeConfig(input: ScrapeConfig, list: ListInfo | undefined, setting
     rolling: Boolean(input.range?.rolling),
   };
 
-  const mode: RunMode =
-    input.mode === 'search' || input.mode === 'timeline' ? input.mode : 'auto';
+  const mode: RunMode = normalizeMode(input.mode);
 
   return {
     listId,
@@ -310,6 +321,10 @@ function sanitizeConfig(input: ScrapeConfig, list: ListInfo | undefined, setting
     maxDelayMs,
     idleScrolls: clamp(input.idleScrolls, 3, 40, settings.idleScrolls),
     maxScrolls: clamp(input.maxScrolls, 10, 1000, settings.maxScrolls),
+    manualScroll: input.manualScroll ?? settings.manualScroll,
+    humanizeLevel: normalizeHumanizeLevel(input.humanizeLevel, settings.humanizeLevel),
+    blankClicks:
+      typeof input.blankClicks === 'boolean' ? input.blankClicks : settings.blankClicks,
     origin: input.origin === 'continuation' ? 'continuation' : 'manual',
     continuationOfRunId:
       input.origin === 'continuation' && input.continuationOfRunId
@@ -324,44 +339,15 @@ function clamp(value: unknown, min: number, max: number, fallback: number): numb
   return Math.min(max, Math.max(min, Math.round(number)));
 }
 
-function buildWindows(config: ScrapeConfig): RunWindow[] {
-  const zone = config.range.timezone;
-  const start = DateTime.fromISO(config.range.start, { setZone: true }).setZone(zone);
-  const end = DateTime.fromISO(config.range.end, { setZone: true }).setZone(zone);
-  const baseMode = config.mode === 'timeline' ? 'timeline' : 'search';
-  const windows: RunWindow[] = [];
-
-  let cursor = start;
-  let index = 0;
-  while (cursor.toMillis() < end.toMillis() && index <= MAX_RANGE_DAYS + 2) {
-    const nextDay = cursor.startOf('day').plus({ days: 1 });
-    const windowEnd = nextDay.toMillis() < end.toMillis() ? nextDay : end;
-    windows.push({
-      index,
-      start: cursor.toUTC().toISO()!,
-      end: windowEnd.toUTC().toISO()!,
-      mode: baseMode,
-      status: 'pending',
-      triedTimeline: false,
-      captured: 0,
-    });
-    cursor = windowEnd;
-    index += 1;
+function normalizeMode(value: unknown): RunMode {
+  if (value === 'search' || value === 'list' || value === 'timeline') {
+    return value === 'timeline' ? 'list' : value;
   }
+  return 'auto';
+}
 
-  if (windows.length === 0) {
-    windows.push({
-      index: 0,
-      start: start.toUTC().toISO()!,
-      end: end.toUTC().toISO()!,
-      mode: baseMode,
-      status: 'pending',
-      triedTimeline: false,
-      captured: 0,
-    });
-  }
-
-  return windows;
+function runStrategy(run: RunRecord): RunStrategy {
+  return run.strategy === 'list' ? 'list' : 'search';
 }
 
 async function startRun(input: ScrapeConfig): Promise<{ ok: boolean; run?: RunRecord; error?: string }> {
@@ -390,7 +376,8 @@ async function startRun(input: ScrapeConfig): Promise<{ ok: boolean; run?: RunRe
     }
 
     const config = sanitizeConfig(input, list, settings);
-    const windows = buildWindows(config);
+    const windows = buildWindows(config.range);
+    const strategy = resolveStartStrategy(config.mode, config.range);
     const timestamp = nowIso();
     const run: RunRecord = {
       id: crypto.randomUUID(),
@@ -398,6 +385,8 @@ async function startRun(input: ScrapeConfig): Promise<{ ok: boolean; run?: RunRe
       updatedAt: timestamp,
       status: 'starting',
       config,
+      strategy,
+      fallbackStarted: false,
       windows,
       currentWindowIndex: 0,
       captured: 0,
@@ -405,6 +394,16 @@ async function startRun(input: ScrapeConfig): Promise<{ ok: boolean; run?: RunRe
       errors: [],
       diagnostics: [],
     };
+    if (strategy === 'list') {
+      run.diagnostics.push({
+        at: timestamp,
+        level: 'info',
+        message:
+          config.mode === 'auto'
+            ? 'Recorrido de lista para el rango reciente; la búsqueda queda como respaldo.'
+            : 'Recorrido de lista solicitado; sin búsqueda de respaldo.',
+      });
+    }
 
     const tab = await chrome.tabs.create({ url: 'about:blank', active: true });
     if (!tab.id) throw new Error('No se pudo crear la pestaña de recolección.');
@@ -415,13 +414,20 @@ async function startRun(input: ScrapeConfig): Promise<{ ok: boolean; run?: RunRe
     run.progress = {
       ...createProgress(),
       phase: 'waiting_page',
-      message: `Abriendo la lista “${config.listName}”…`,
+      message:
+        strategy === 'list'
+          ? `Abriendo la lista “${config.listName}” y recorriéndola hasta ${config.range.label}…`
+          : `Abriendo los resultados de “${config.listName}”…`,
+      oldestSeenAt: null,
     };
     await saveRun(run);
     await setActiveRunId(run.id);
 
     const first = run.windows[0]!;
-    const url = buildWindowUrl(config.listId, first.start, first.end, first.mode);
+    const url =
+      strategy === 'list'
+        ? buildListUrl(config.listId)
+        : buildWindowUrl(config.listId, first.start, first.end, 'search');
     try {
       await chrome.tabs.update(tab.id, { url, active: true });
     } catch (updateError) {
@@ -484,6 +490,9 @@ async function startContinuationRun(
     maxDelayMs: input.maxDelayMs ?? settings.maxDelayMs,
     idleScrolls: input.idleScrolls ?? settings.idleScrolls,
     maxScrolls: input.maxScrolls ?? settings.maxScrolls,
+    manualScroll: input.manualScroll ?? settings.manualScroll,
+    humanizeLevel: input.humanizeLevel ?? settings.humanizeLevel,
+    blankClicks: input.blankClicks ?? settings.blankClicks,
     origin: 'continuation',
     continuationOfRunId: tracking.lastRunId,
   };
@@ -491,17 +500,21 @@ async function startContinuationRun(
   return startRun(config);
 }
 
-function toContentContext(run: RunRecord, window: RunWindow): ContentContext {
+function toContentContext(run: RunRecord, window: RunWindow, expectedUrl: string): ContentContext {
+  const strategy = runStrategy(run);
+  const listPass = strategy === 'list';
   return {
     runId: run.id,
     listId: run.config.listId,
     listName: run.config.listName,
     range: run.config.range,
     mode: run.config.mode,
-    windowIndex: window.index,
-    windowStart: window.start,
-    windowEnd: window.end,
-    windowMode: window.mode,
+    windowIndex: listPass ? 0 : window.index,
+    windowStart: listPass ? run.config.range.start : window.start,
+    windowEnd: listPass ? run.config.range.end : window.end,
+    windowMode: listPass ? 'list' : 'search',
+    expectedUrl,
+    strategy,
     paused: run.status === 'paused',
     includeReplies: run.config.includeReplies,
     includeReposts: run.config.includeReposts,
@@ -511,6 +524,9 @@ function toContentContext(run: RunRecord, window: RunWindow): ContentContext {
     maxDelayMs: run.config.maxDelayMs,
     idleScrolls: run.config.idleScrolls,
     maxScrolls: run.config.maxScrolls,
+    manualScroll: run.config.manualScroll === true,
+    humanizeLevel: run.config.humanizeLevel,
+    blankClicks: run.config.blankClicks,
     alreadyCaptured: run.captured,
   };
 }
@@ -524,26 +540,41 @@ async function handleContentReady(
     return { ok: true, context: null, reason: run.status };
   }
 
-  const window = run.windows[run.currentWindowIndex];
+  const strategy = runStrategy(run);
+  const window = run.windows[run.currentWindowIndex] ?? run.windows[0];
   if (!window) return { ok: true, context: null, reason: 'no_window' };
-  if (window.status === 'done' || window.status === 'failed') {
-    return { ok: true, context: null, reason: 'advancing' };
+
+  let expectedUrl: string;
+  if (strategy === 'list') {
+    expectedUrl = buildListUrl(run.config.listId);
+  } else {
+    if (window.status === 'done' || window.status === 'failed') {
+      return { ok: true, context: null, reason: 'advancing' };
+    }
+    expectedUrl = buildWindowUrl(run.config.listId, window.start, window.end, 'search');
   }
 
-  window.status = 'active';
+  if (!matchesWindowUrl(sender.url, expectedUrl)) {
+    if (run.status !== 'navigating') {
+      await markRunAbandoned(run, 'La pestaña dejó de mostrar la búsqueda o la lista de la recolección.');
+    }
+    return { ok: true, context: null, reason: 'unexpected_url' };
+  }
+
+  if (strategy !== 'list') window.status = 'active';
   if (run.status !== 'paused') run.status = 'running';
   run.progress = {
     ...run.progress,
     phase: 'waiting_page',
     message:
-      window.mode === 'timeline'
-        ? 'Cargando el timeline de la lista…'
+      strategy === 'list'
+        ? 'Cargando el timeline de la lista y leyendo las fechas…'
         : 'Cargando los resultados de la búsqueda…',
     updatedAt: nowIso(),
   };
   run.updatedAt = nowIso();
   await saveRun(run);
-  return { ok: true, context: toContentContext(run, window) };
+  return { ok: true, context: toContentContext(run, window, expectedUrl) };
 }
 
 async function handlePosts(
@@ -564,9 +595,18 @@ async function handlePosts(
     return Number.isFinite(created) && created >= startMs && created < endMs;
   });
 
-  const windowIndex = Number.isInteger(message.windowIndex)
+  const fallbackWindowIndex = Number.isInteger(message.windowIndex)
     ? Math.max(0, Math.min(run.windows.length - 1, message.windowIndex))
     : run.currentWindowIndex;
+
+  const grouped = new Map<number, NormalizedPost[]>();
+  for (const post of valid) {
+    const byDate = findWindowIndex(run.windows, Date.parse(post.createdAt));
+    const index = byDate >= 0 ? byDate : fallbackWindowIndex;
+    const list = grouped.get(index) ?? [];
+    list.push(post);
+    grouped.set(index, list);
+  }
 
   const newest = valid.reduce<NormalizedPost | null>(
     (latest, post) =>
@@ -574,7 +614,14 @@ async function handlePosts(
     null,
   );
 
-  const inserted = await addPosts(run.id, windowIndex, valid);
+  let inserted = 0;
+  for (const [windowIndex, posts] of grouped) {
+    const added = await addPosts(run.id, windowIndex, posts);
+    inserted += added;
+    const window = run.windows[windowIndex];
+    if (window) window.captured += added;
+  }
+
   let snapshotChanged = false;
   if (newest) {
     const snapshot = toLastCapturedPost(newest);
@@ -587,11 +634,7 @@ async function handlePosts(
     }
   }
 
-  if (inserted > 0) {
-    run.captured += inserted;
-    const window = run.windows[windowIndex];
-    if (window) window.captured += inserted;
-  }
+  if (inserted > 0) run.captured += inserted;
 
   if (inserted > 0 || snapshotChanged) {
     run.updatedAt = nowIso();
@@ -604,12 +647,29 @@ async function handlePosts(
   return { ok: true, inserted, total: run.captured, stop };
 }
 
+function markListCoverage(run: RunRecord, frontier: string | null | undefined): number {
+  if (!frontier) return 0;
+  const frontierMs = Date.parse(frontier);
+  if (!Number.isFinite(frontierMs)) return 0;
+  const covered = new Set(listPassCoveredIndices(run.windows, frontierMs));
+  let changed = 0;
+  for (const window of run.windows) {
+    if (!covered.has(window.index)) continue;
+    if (window.status !== 'pending' && window.status !== 'active') continue;
+    window.status = 'done';
+    window.reason = 'list_pass';
+    changed += 1;
+  }
+  return changed;
+}
+
 async function handleProgress(
   message: {
     windowIndex: number;
     scrolls: number;
     windowCaptured: number;
     oldestSeenAt: string | null;
+    coveredUntilAt?: string | null;
     pageHasResults: boolean;
     hidden: boolean;
     phase: RunRecord['progress']['phase'];
@@ -619,7 +679,13 @@ async function handleProgress(
 ): Promise<{ ok: boolean }> {
   const run = await getRunForSender(sender);
   if (!run || !ACTIVE_RUN_STATUSES.includes(run.status)) return { ok: true };
-  if (message.windowIndex !== run.currentWindowIndex) return { ok: true };
+  const strategy = runStrategy(run);
+  if (strategy !== 'list' && message.windowIndex !== run.currentWindowIndex) {
+    return { ok: true };
+  }
+
+  const covered =
+    strategy === 'list' ? markListCoverage(run, message.coveredUntilAt) : 0;
 
   run.progress = {
     phase: message.phase,
@@ -633,16 +699,19 @@ async function handleProgress(
   };
   run.updatedAt = nowIso();
   await saveRun(run);
+  if (covered > 0) broadcast({ type: 'RUN_UPDATED', run });
   return { ok: true };
 }
 
-function shouldFallbackToTimeline(run: RunRecord, window: RunWindow, reason: string): boolean {
-  if (run.config.mode !== 'auto' || window.mode !== 'search' || window.triedTimeline) {
-    return false;
+function markRemainingUncovered(run: RunRecord, reason: string): number {
+  let changed = 0;
+  for (const window of run.windows) {
+    if (window.status !== 'pending' && window.status !== 'active') continue;
+    window.status = 'done';
+    window.reason = reason;
+    changed += 1;
   }
-  if (reason === 'no_results' || reason === 'page_error') return true;
-  if ((reason === 'max_scrolls' || reason === 'exhausted') && window.captured === 0) return true;
-  return false;
+  return changed;
 }
 
 async function handleWindowDone(
@@ -671,47 +740,16 @@ async function handleWindowDone(
   if (limitReached) {
     window.status = 'done';
     window.reason = 'max_posts';
-    const skipped = run.windows.slice(run.currentWindowIndex + 1);
-    for (const pending of skipped) {
-      if (pending.status === 'pending') {
-        pending.status = 'done';
-        pending.reason = 'skipped_limit';
-      }
-    }
+    const skipped = markRemainingUncovered(run, 'skipped_limit');
     run.diagnostics.push({
       at: nowIso(),
       level: 'info',
-      message: `Límite de posts alcanzado (${run.captured}). Se omitieron ${skipped.length} ventanas restantes.`,
+      message: `Límite de posts alcanzado (${run.captured}). Se omitieron ${skipped} ventanas restantes.`,
     });
     trimDiagnostics(run);
     run.updatedAt = nowIso();
     await saveRun(run);
     await finalizeRun(run);
-    return { ok: true };
-  }
-
-  if (shouldFallbackToTimeline(run, window, reason)) {
-    window.triedTimeline = true;
-    window.mode = 'timeline';
-    window.status = 'pending';
-    window.reason = undefined;
-    run.status = 'navigating';
-    run.progress = {
-      ...createProgress(),
-      phase: 'navigating',
-      message: 'La búsqueda no fue suficiente. Probando el timeline de la lista…',
-      windowCaptured: window.captured,
-    };
-    run.diagnostics.push({
-      at: nowIso(),
-      level: 'info',
-      message: `Fallback a timeline para la ventana ${window.index + 1} (${reason}).`,
-    });
-    trimDiagnostics(run);
-    run.updatedAt = nowIso();
-    await saveRun(run);
-    await sleep(600);
-    await navigateToWindow(run, window);
     return { ok: true };
   }
 
@@ -752,25 +790,6 @@ async function handleWindowFailed(
   const window = run.windows[run.currentWindowIndex];
   if (!window) return { ok: true };
 
-  if (shouldFallbackToTimeline(run, window, 'page_error')) {
-    window.triedTimeline = true;
-    window.mode = 'timeline';
-    window.status = 'pending';
-    window.reason = undefined;
-    run.status = 'navigating';
-    run.progress = {
-      ...createProgress(),
-      phase: 'navigating',
-      message: 'La búsqueda falló. Probando el timeline de la lista…',
-      windowCaptured: window.captured,
-    };
-    run.updatedAt = nowIso();
-    await saveRun(run);
-    await sleep(600);
-    await navigateToWindow(run, window);
-    return { ok: true };
-  }
-
   window.status = 'failed';
   window.reason = message.reason || 'error';
   run.errors.push(message.message || 'La recolección falló en esta ventana.');
@@ -781,8 +800,136 @@ async function handleWindowFailed(
   });
   trimDiagnostics(run);
   run.updatedAt = nowIso();
+  if (['rate_limited', 'login_required', 'navigation_changed'].includes(window.reason)) {
+    run.status = run.captured > 0 ? 'partial' : 'failed';
+    await finalizeRun(run, message.message);
+    return { ok: true };
+  }
   await saveRun(run);
   await advanceRun(run);
+  return { ok: true };
+}
+
+async function handleListPassDone(
+  message: {
+    reason: string;
+    message?: string;
+    scrolls?: number;
+    captured?: number;
+    oldestSeenAt: string | null;
+    coveredUntilAt?: string | null;
+    reachedStart?: boolean;
+  },
+  sender: chrome.runtime.MessageSender,
+): Promise<{ ok: boolean }> {
+  const run = await getRunForSender(sender);
+  if (!run) return { ok: true };
+  if (runStrategy(run) !== 'list') return { ok: true };
+  if (run.status === 'cancelled') return { ok: true };
+
+  const reason = String(message.reason || 'exhausted');
+  if (reason === 'cancelled') return { ok: true };
+
+  const frontier = message.coveredUntilAt ?? message.oldestSeenAt ?? null;
+  const covered = markListCoverage(run, frontier);
+  const reached = Boolean(message.reachedStart) || reason === 'date_boundary';
+  if (reached) {
+    for (const window of run.windows) {
+      if (window.status !== 'pending' && window.status !== 'active') continue;
+      window.status = 'done';
+      window.reason = 'list_pass';
+    }
+  }
+
+  run.diagnostics.push({
+    at: nowIso(),
+    level: reached ? 'info' : 'warn',
+    message: reached
+      ? 'El recorrido de lista alcanzó el inicio del rango.'
+      : `El recorrido de lista terminó antes del inicio del rango (${reason}); ${covered} ventanas recientes cubiertas.`,
+  });
+  trimDiagnostics(run);
+
+  const limitReached =
+    run.captured >= run.config.maxPosts || run.captured >= MAX_STORED_POSTS_PER_RUN;
+  if (limitReached) {
+    markRemainingUncovered(run, 'max_posts');
+    run.updatedAt = nowIso();
+    await saveRun(run);
+    await finalizeRun(run, 'Se alcanzó el máximo de posts configurado.');
+    return { ok: true };
+  }
+
+  if (reached) {
+    run.updatedAt = nowIso();
+    await saveRun(run);
+    await finalizeRun(run);
+    return { ok: true };
+  }
+
+  const fatalReasons = new Set(['login_required', 'rate_limited', 'navigation_changed']);
+  if (fatalReasons.has(reason)) {
+    const text = message.message || 'El recorrido de lista se interrumpió.';
+    run.errors.push(text);
+    run.status = run.captured > 0 ? 'partial' : 'failed';
+    run.updatedAt = nowIso();
+    await saveRun(run);
+    await finalizeRun(run, text);
+    return { ok: true };
+  }
+
+  const pendingCount = run.windows.filter(
+    (window) => window.status === 'pending' || window.status === 'active',
+  ).length;
+  if (pendingCount === 0) {
+    run.updatedAt = nowIso();
+    await saveRun(run);
+    await finalizeRun(run);
+    return { ok: true };
+  }
+
+  if (run.config.mode === 'auto') {
+    const firstIndex = firstPendingWindowIndex(run.windows);
+    if (firstIndex < 0) {
+      run.updatedAt = nowIso();
+      await saveRun(run);
+      await finalizeRun(run);
+      return { ok: true };
+    }
+
+    run.strategy = 'search';
+    run.fallbackStarted = true;
+    run.currentWindowIndex = firstIndex;
+    run.status = 'navigating';
+    run.progress = {
+      ...createProgress(),
+      phase: 'navigating',
+      message: `La lista no llegó al inicio del rango. Buscando ${pendingCount} días restantes…`,
+      oldestSeenAt: frontier,
+    };
+    run.diagnostics.push({
+      at: nowIso(),
+      level: 'info',
+      message: `Respaldo de búsqueda para ${pendingCount} ventanas anteriores (${reason}).`,
+    });
+    trimDiagnostics(run);
+    run.updatedAt = nowIso();
+    await saveRun(run);
+    await sleep(randomDelay(500, 1400));
+    await navigateToWindow(run, run.windows[firstIndex]!);
+    return { ok: true };
+  }
+
+  markRemainingUncovered(run, 'list_incomplete');
+  run.errors.push(
+    'El recorrido de la lista no alcanzó el inicio del rango. Activa el modo automático para buscar los días restantes.',
+  );
+  run.updatedAt = nowIso();
+  await saveRun(run);
+  await finalizeRun(
+    run,
+    'El recorrido de lista terminó sin alcanzar el inicio del rango. El seguimiento no avanzó.',
+  );
   return { ok: true };
 }
 
@@ -791,7 +938,7 @@ async function navigateToWindow(run: RunRecord, window: RunWindow): Promise<void
     await markRunAbandoned(run, 'La pestaña de recolección ya no existe.');
     return;
   }
-  const url = buildWindowUrl(run.config.listId, window.start, window.end, window.mode);
+  const url = buildWindowUrl(run.config.listId, window.start, window.end, 'search');
   try {
     await chrome.tabs.update(run.tabId, { url });
   } catch (error) {
@@ -804,23 +951,21 @@ async function navigateToWindow(run: RunRecord, window: RunWindow): Promise<void
 }
 
 async function advanceRun(run: RunRecord): Promise<void> {
-  const nextIndex = run.currentWindowIndex + 1;
-  if (nextIndex < run.windows.length) {
+  const nextIndex = nextPendingWindowIndex(run.windows, run.currentWindowIndex);
+  if (nextIndex >= 0) {
     run.currentWindowIndex = nextIndex;
     const next = run.windows[nextIndex]!;
-    next.status = 'pending';
-    next.triedTimeline = false;
-    next.reason = undefined;
-    next.mode = run.config.mode === 'timeline' ? 'timeline' : 'search';
     run.status = 'navigating';
     run.progress = {
-      ...createProgress(),
+      ...run.progress,
       phase: 'navigating',
       message: `Preparando la ventana ${nextIndex + 1} de ${run.windows.length}…`,
+      updatedAt: nowIso(),
     };
     run.updatedAt = nowIso();
     await saveRun(run);
-    await sleep(500);
+    // Pausa breve y variable antes de navegar, sin bloquear al service worker.
+    await sleep(randomDelay(400, 1200));
     await navigateToWindow(run, next);
     return;
   }
@@ -828,15 +973,22 @@ async function advanceRun(run: RunRecord): Promise<void> {
   await finalizeRun(run);
 }
 
-async function finalizeRun(run: RunRecord): Promise<void> {
+function randomDelay(min: number, max: number): number {
+  return Math.floor(min + Math.random() * Math.max(1, max - min));
+}
+
+async function finalizeRun(run: RunRecord, message?: string): Promise<void> {
   if (!['completed', 'partial', 'failed', 'cancelled'].includes(run.status)) {
     const failed = run.windows.filter((window) => window.status === 'failed').length;
     const active = run.windows.find((window) => window.status === 'active');
     if (active) active.status = 'failed';
+    const incomplete = run.windows.filter(
+      (window) => window.status !== 'failed' && !isWindowCovered(window),
+    ).length;
     run.status =
       run.captured === 0 && failed === run.windows.length && failed > 0
         ? 'failed'
-        : failed > 0
+        : failed > 0 || incomplete > 0
           ? 'partial'
           : 'completed';
   }
@@ -845,14 +997,14 @@ async function finalizeRun(run: RunRecord): Promise<void> {
   run.progress = {
     ...run.progress,
     phase: 'finished',
-    message:
+    message: message ?? (
       run.status === 'cancelled'
         ? 'Recolección cancelada.'
         : run.status === 'failed' && run.errors.length > 0
           ? run.errors[run.errors.length - 1]!
           : run.captured === 0
             ? 'La recolección terminó sin posts dentro del rango.'
-            : `Recolección terminada: ${run.captured} posts.`,
+            : `Recolección terminada: ${run.captured} posts.`),
     updatedAt: nowIso(),
   };
   run.updatedAt = nowIso();
@@ -875,10 +1027,12 @@ async function handleTabRemoved(tabId: number): Promise<void> {
 async function markRunAbandoned(run: RunRecord, message: string): Promise<void> {
   if (!ACTIVE_RUN_STATUSES.includes(run.status)) return;
 
-  const window = run.windows[run.currentWindowIndex];
-  if (window && window.status !== 'done') {
-    window.status = 'failed';
-    window.reason = 'abandoned';
+  if (runStrategy(run) !== 'list') {
+    const window = run.windows[run.currentWindowIndex];
+    if (window && window.status !== 'done') {
+      window.status = 'failed';
+      window.reason = 'abandoned';
+    }
   }
 
   run.status = run.captured > 0 ? 'partial' : 'failed';
@@ -1070,6 +1224,8 @@ async function handleMessage(
       return handlePosts(message, sender);
     case 'PROGRESS':
       return handleProgress(message, sender);
+    case 'LIST_PASS_DONE':
+      return handleListPassDone(message, sender);
     case 'WINDOW_DONE':
       return handleWindowDone(message, sender);
     case 'WINDOW_FAILED':

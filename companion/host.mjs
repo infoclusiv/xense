@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { listCodexModels, MODEL_ID } from './codex-models.mjs';
 
 const MAX_MESSAGE = 1024 * 1024;
 // The Windows launcher can select a specific Codex binary without changing global PATH.
@@ -26,21 +27,26 @@ function classifyFailure(raw) {
   if (/(unknown (argument|option)|unrecognized (argument|option)|unexpected argument|found argument)/i.test(log))
     return 'La versión del CLI podría no admitir estos argumentos. Ejecuta: codex exec --help';
   if (/(unknown model|model not found|model does not exist|unsupported model)/i.test(log))
-    return 'El modelo configurado no parece estar disponible. Prueba dejando el campo Modelo vacío.';
+    return 'El modelo configurado no parece estar disponible. Actualiza la lista o elige Predeterminado del CLI.';
   if (/(network|connection refused|could not resolve|connection reset|timed out|tls error)/i.test(log))
     return 'Parece un fallo de conectividad con el proveedor.';
   return 'Causa no identificada. Ejecuta una prueba de codex exec en PowerShell para obtener el diagnóstico.';
 }
 
+function startCli(binary, args, options = {}) {
+  const shell = process.platform === 'win32' && !/\.exe$/i.test(binary);
+  return spawn(shell && /\s/.test(binary) ? `"${binary}"` : binary, args, {
+    cwd: options.cwd,
+    env: options.env ?? process.env,
+    windowsHide: true,
+    shell,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+}
+
 function execute(binary, args, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(binary, args, {
-      cwd: options.cwd,
-      env: options.env ?? process.env,
-      windowsHide: true,
-      shell: process.platform === 'win32',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    const child = startCli(binary, args, options);
     const chunks = [];
     let bytes = 0;
     let errors = '';
@@ -75,7 +81,7 @@ async function analyze(request) {
   if (typeof request.prompt !== 'string' || !request.prompt.trim() || request.prompt.length > 75000)
     throw new Error('El contenido de análisis no es válido.');
   const model = typeof request.model === 'string' ? request.model.trim() : '';
-  if (model && !/^[A-Za-z0-9._/+:-]{1,100}$/.test(model))
+  if (model && !MODEL_ID.test(model))
     throw new Error('Nombre de modelo no válido.');
   const folder = await mkdtemp(join(tmpdir(), 'xense-ai-'));
   try {
@@ -116,6 +122,11 @@ async function analyze(request) {
   }
 }
 async function handle(request) {
+  if (request?.type === 'LIST_CODEX_MODELS') {
+    const child = startCli(CODEX_BINARY, ['app-server'], { cwd: tmpdir() });
+    const models = await listCodexModels(child, MAX_MESSAGE);
+    return { ok: true, models };
+  }
   if (request?.type === 'PING') {
     const [codex, opencode] = await Promise.all([inspectCli(CODEX_BINARY), inspectCli('opencode')]);
     return {

@@ -22,10 +22,14 @@ Primera fase: la extensión se conecta a un proceso Node.js local mediante **Chr
 
 El botón de comprobación solo verifica si se puede invocar el CLI; no prueba si el usuario conserva sesiones activas o cuotas. El análisis real realiza la prueba completa.
 
+El desplegable de ChatGPT consulta `model/list` en el servidor local del mismo Codex CLI que ejecuta los análisis. Codex puede devolver su propio catálogo en caché. Si falla la consulta, Xense conserva la última lista que recibió y mantiene disponible **Predeterminado del CLI**.
+
 ## Seguridad
 
 Los prompts nunca se pasan como parámetros del shell: Codex los recibe mediante stdin y OpenCode lee un archivo temporal. Los CLI se ejecutan en carpetas temporales; Codex usa sandbox read-only y la configuración de OpenCode deniega herramientas. Los datos temporales se borran al finalizar. No se guardan tokens ni contraseñas en IndexedDB.
 
-Los posts se envían al proveedor de IA elegido, fuera de tu equipo. El usuario inicia manualmente cada análisis. Se procesan como máximo ocho lotes de 11.500 caracteres; los posts omitidos se indican en el resultado. Las salidas se guardan por recolección en IndexedDB. Las ejecuciones largas dependen de la vida útil del canal Native Messaging.
+Los posts se envían al proveedor de IA elegido al pulsar **Generar infografía**. Xense procesa la recolección en lotes y consolida los hallazgos por etapas. Mantén abierto el dashboard mientras dure el análisis. El botón **Detener** interrumpe el proceso después de la consulta en curso.
+
+El CLI devuelve los hallazgos en texto estructurado. Xense genera los gráficos con los datos guardados, muestra la infografía en el dashboard y la guarda por recolección en IndexedDB. Puedes descargarla como un HTML autónomo desde **Análisis guardados**.
 
 La ruta ChatGPT OAuth directo con el SDK oficial Sign in with ChatGPT será una etapa posterior, independiente de este adaptador Codex CLI.

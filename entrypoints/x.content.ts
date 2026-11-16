@@ -6,14 +6,24 @@ import type {
   MediaItem,
   NormalizedPost,
 } from '../lib/types';
-
-declare global {
-  interface Window {
-    __xenseHookInstalled?: boolean;
-  }
-}
+import {
+  humanizeProfile,
+  humanizedDelay,
+  nextBlankClickDelay,
+  planBoundary,
+  planPointerPath,
+  planReadingPause,
+  planScrollStep,
+  randomBetween,
+  type HumanizeProfile,
+  type Point,
+} from '../lib/x/humanize';
+import { listPassReachedStart } from '../lib/x/strategy';
+import { matchesWindowUrl } from '../lib/x/urls';
 
 const PAGE_SOURCE = 'xense-page';
+const FRONTIER_SIZE = 24;
+const USER_GRACE_MS = 8_000;
 
 let context: ContentContext | null = null;
 let contextResolved = false;
@@ -25,20 +35,33 @@ let limitReached = false;
 let extensionInvalidated = false;
 
 let queuedPosts: NormalizedPost[] = [];
-let flushing = false;
+let flushing: Promise<void> | null = null;
 let flushScheduled = false;
 
 const windowSeen = new Set<string>();
 let currentWindowCaptured = 0;
 let oldestSeenMs: number | null = null;
 let hadPayload = false;
-let pageHasResults = false;
+let rateLimited = false;
 let scrolls = 0;
 let domFallbackUsed = false;
 let lastProgressAt = 0;
 let lastListsSignature = '';
-let listDiscoveryStarted = false;
 let listInfoSignature = '';
+
+/** Fechas de los últimos posts únicos vistos, en orden de aparición. */
+let frontierDates: number[] = [];
+const frontierIds = new Set<string>();
+let boundaryMarginMs = 0;
+let boundaryRequiredStreak = 2;
+let boundaryStreak = 0;
+let humanProfile: HumanizeProfile = humanizeProfile('off');
+let blankClickBudget = 0;
+let blankClicksDone = 0;
+let nextBlankClickAt = Number.POSITIVE_INFINITY;
+let lastPointerAt = 0;
+let lastPointer: Point | null = null;
+let lastUserInputAt = 0;
 
 export default defineContentScript({
   matches: ['https://x.com/*', 'https://twitter.com/*'],
@@ -46,17 +69,23 @@ export default defineContentScript({
   main() {
     window.addEventListener('message', onPageMessage, false);
     chrome.runtime.onMessage.addListener(onRuntimeMessage);
+    watchTrustedUserInput();
     void boot();
     startUrlWatcher();
   },
 });
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function watchTrustedUserInput(): void {
+  const mark = (event: Event) => {
+    if (event.isTrusted) lastUserInputAt = Date.now();
+  };
+  for (const type of ['pointerdown', 'keydown', 'wheel', 'touchstart']) {
+    document.addEventListener?.(type, mark, { passive: true, capture: true });
+  }
 }
 
-function randomBetween(min: number, max: number): number {
-  return Math.floor(min + Math.random() * Math.max(1, max - min));
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function nowIso(): string {
@@ -79,29 +108,22 @@ async function boot(): Promise<void> {
 
   if (context) {
     paused = context.paused;
-    if (pendingTweets.length > 0) {
-      const pending = pendingTweets;
-      pendingTweets = [];
-      processIncomingPosts(pending, false);
-    }
     void runScraper(context);
     return;
   }
 
   pendingTweets = [];
-  void discoverListsIfNeeded();
+  void discoverVisibleLists();
   void reportListPageInfo();
 }
 
 function startUrlWatcher(): void {
   let lastUrl = location.href;
   window.setInterval(() => {
+    if (contextResolved && !context) void discoverVisibleLists();
     if (location.href === lastUrl) return;
     lastUrl = location.href;
-    if (!context) {
-      void discoverListsIfNeeded();
-      void reportListPageInfo();
-    }
+    if (contextResolved && !context) void reportListPageInfo();
   }, 1500);
 }
 
@@ -113,16 +135,22 @@ async function waitForBody(timeoutMs: number): Promise<void> {
 }
 
 function onPageMessage(event: MessageEvent): void {
-  if (event.source !== window) return;
+  if (event.source !== window || event.origin !== location.origin) return;
   const data = event.data;
   if (!data || data.source !== PAGE_SOURCE) return;
+  const onCollectionPage = context && scraping && matchesWindowUrl(location.href, context.expectedUrl);
+
+  if (data.kind === 'rate_limited' && (!contextResolved || onCollectionPage)) {
+    rateLimited = true;
+    return;
+  }
 
   if (data.kind === 'tweets' && Array.isArray(data.posts)) {
     const posts = data.posts as NormalizedPost[];
     if (!contextResolved) {
       pendingTweets.push(...posts);
       if (pendingTweets.length > 2000) pendingTweets = pendingTweets.slice(-2000);
-    } else if (context) {
+    } else if (onCollectionPage && !stopRequested) {
       processIncomingPosts(posts, false);
     }
     return;
@@ -191,9 +219,38 @@ function diagnostic(level: DiagnosticEntry['level'], message: string, operation?
   });
 }
 
+function observePostDates(posts: NormalizedPost[]): void {
+  for (const post of posts) {
+    if (!post || typeof post.id !== 'string' || !post.id) continue;
+    const createdMs = Date.parse(post.createdAt);
+    if (!Number.isFinite(createdMs)) continue;
+
+    if (oldestSeenMs === null || createdMs < oldestSeenMs) oldestSeenMs = createdMs;
+    if (frontierIds.has(post.id)) continue;
+    frontierIds.add(post.id);
+    frontierDates.push(createdMs);
+    if (frontierDates.length > FRONTIER_SIZE) frontierDates.shift();
+  }
+}
+
+/** Fecha más antigua confirmada por la cola reciente; null si aún no hay datos. */
+function currentFrontierMs(): number | null {
+  if (frontierDates.length === 0) return null;
+  let oldest = Number.POSITIVE_INFINITY;
+  for (const value of frontierDates) oldest = Math.min(oldest, value);
+  return Number.isFinite(oldest) ? oldest : null;
+}
+
+function frontierIso(): string | null {
+  const frontier = currentFrontierMs();
+  return frontier !== null ? new Date(frontier).toISOString() : null;
+}
+
 function processIncomingPosts(posts: NormalizedPost[], fromDom: boolean): void {
   if (!context) return;
   if (!fromDom) hadPayload = true;
+
+  observePostDates(posts);
 
   const startMs = Date.parse(context.windowStart);
   const endMs = Date.parse(context.windowEnd);
@@ -203,7 +260,6 @@ function processIncomingPosts(posts: NormalizedPost[], fromDom: boolean): void {
     const createdMs = Date.parse(post.createdAt);
     if (!Number.isFinite(createdMs)) continue;
 
-    if (oldestSeenMs === null || createdMs < oldestSeenMs) oldestSeenMs = createdMs;
     if (createdMs < startMs || createdMs >= endMs) continue;
     if (!context.includeReposts && post.isRepost) continue;
     if (!context.includeReplies && post.isReply) continue;
@@ -215,7 +271,6 @@ function processIncomingPosts(posts: NormalizedPost[], fromDom: boolean): void {
     queuedPosts.push(post);
   }
 
-  if (posts.length > 0) pageHasResults = true;
   scheduleFlush();
 }
 
@@ -228,28 +283,31 @@ function scheduleFlush(): void {
   }, 450);
 }
 
-async function flushQueue(): Promise<void> {
-  if (flushing || !context) return;
-  flushing = true;
-  try {
-    while (queuedPosts.length > 0) {
-      const batch = queuedPosts.splice(0, 100);
-      const response = await sendBg<{ stop?: boolean; ok?: boolean }>({
-        type: 'POSTS_BATCH',
-        windowIndex: context.windowIndex,
-        posts: batch,
-      });
-      if (!response) {
-        queuedPosts.unshift(...batch);
-        break;
-      }
-      if (response.stop) {
-        limitReached = true;
-        break;
-      }
+function flushQueue(): Promise<void> {
+  if (flushing) return flushing;
+  if (!context || queuedPosts.length === 0) return Promise.resolve();
+  flushing = sendQueuedPosts(context.windowIndex).finally(() => {
+    flushing = null;
+  });
+  return flushing;
+}
+
+async function sendQueuedPosts(windowIndex: number): Promise<void> {
+  while (queuedPosts.length > 0) {
+    const batch = queuedPosts.splice(0, 100);
+    const response = await sendBg<{ stop?: boolean; ok?: boolean }>({
+      type: 'POSTS_BATCH',
+      windowIndex,
+      posts: batch,
+    });
+    if (!response) {
+      queuedPosts.unshift(...batch);
+      return;
     }
-  } finally {
-    flushing = false;
+    if (response.stop) {
+      limitReached = true;
+      return;
+    }
   }
 }
 
@@ -274,15 +332,10 @@ function detectLoginWall(): boolean {
   return hasLoginText && !hadPayload;
 }
 
-function detectRateLimit(): boolean {
-  const text = pageText();
-  return (
-    text.includes('rate limit') ||
-    text.includes('you are over the daily limit') ||
-    text.includes('limite de velocidad') ||
-    text.includes('límite de velocidad') ||
-    text.includes('demasiadas solicitudes')
-  );
+function pageNoticeText(): string {
+  if (!hasArticles()) return pageText();
+  const notices = document.querySelectorAll('[role="alert"], [data-testid="toast"], [data-testid="emptyState"]');
+  return Array.from(notices, (notice) => notice.textContent ?? '').join(' ').toLowerCase();
 }
 
 function detectNoResults(): boolean {
@@ -296,8 +349,7 @@ function detectNoResults(): boolean {
   );
 }
 
-function detectPageError(): boolean {
-  const text = pageText();
+function detectPageError(text: string): boolean {
   return (
     text.includes('something went wrong') ||
     text.includes('try reloading') ||
@@ -307,55 +359,31 @@ function detectPageError(): boolean {
   );
 }
 
-function clickRetry(): boolean {
-  const candidates = Array.from(document.querySelectorAll<HTMLElement>('button, [role="button"]'));
-  const button = candidates.find((element) =>
-    /retry|reintentar|try again|inténtalo de nuevo|intentalo de nuevo/i.test(
-      element.textContent ?? '',
-    ),
-  );
-  if (button) {
-    button.click();
-    return true;
+function detectCollectionFailure(ctx: ContentContext): string | null {
+  if (detectLoginWall()) return 'login_required';
+  if (!matchesWindowUrl(location.href, ctx.expectedUrl)) return 'navigation_changed';
+  const notice = pageNoticeText();
+  if (rateLimited || /rate limit|over the daily limit|l[ií]mite de velocidad|demasiadas solicitudes/.test(notice)) {
+    return 'rate_limited';
   }
-  return false;
+  if (detectPageError(notice)) return 'page_error';
+  return null;
 }
 
-function clickShowMore(): boolean {
-  const candidates = Array.from(document.querySelectorAll<HTMLElement>('button, [role="button"]'));
-  const button = candidates.find((element) =>
-    /show more|mostrar más|mostrar mas|ver más|ver mas|cargar más|cargar mas/i.test(
-      element.textContent ?? '',
-    ),
-  );
-  if (button) {
-    button.click();
-    return true;
-  }
-  return false;
-}
-
-function scrollToBottom(): void {
-  const height = Math.max(
-    document.documentElement.scrollHeight,
-    document.body?.scrollHeight ?? 0,
-  );
-  window.scrollTo(0, height);
-  document.documentElement.scrollTop = height;
-  if (document.body) document.body.scrollTop = height;
-}
-
-function sendProgress(phase: 'waiting_page' | 'scrolling', message: string, force = false): void {
+async function sendProgress(phase: 'waiting_page' | 'scrolling', message: string): Promise<void> {
   if (!context) return;
   const now = Date.now();
-  if (!force && now - lastProgressAt < 1500) return;
+  if (now - lastProgressAt < 1500) return;
   lastProgressAt = now;
-  void sendBg({
+  const frontier = frontierIso();
+  const seen = frontier ?? (oldestSeenMs !== null ? new Date(oldestSeenMs).toISOString() : null);
+  await sendBg({
     type: 'PROGRESS',
     windowIndex: context.windowIndex,
     scrolls,
     windowCaptured: currentWindowCaptured,
-    oldestSeenAt: oldestSeenMs !== null ? new Date(oldestSeenMs).toISOString() : null,
+    oldestSeenAt: seen,
+    coveredUntilAt: context.strategy === 'list' ? frontier : undefined,
     pageHasResults: hadPayload || hasArticles(),
     hidden: document.visibilityState === 'hidden',
     phase,
@@ -363,29 +391,38 @@ function sendProgress(phase: 'waiting_page' | 'scrolling', message: string, forc
   });
 }
 
+function shortDate(iso: string | null): string {
+  if (!iso) return '—';
+  try {
+    return new Date(iso).toLocaleString('es', {
+      day: '2-digit',
+      month: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  } catch {
+    return iso;
+  }
+}
+
 async function waitForInitialState(ctx: ContentContext): Promise<string | null> {
-  const deadline = Date.now() + 30000;
-  let errorSeen = 0;
+  let deadline = Date.now() + 30000;
   while (Date.now() < deadline) {
     await flushQueue();
-    sendProgress('waiting_page', 'Esperando los resultados de X…');
+    await sendProgress('waiting_page', 'Esperando los resultados de X…');
 
     if (stopRequested || extensionInvalidated) return 'cancelled';
-    if (detectRateLimit()) return 'rate_limited';
-    if (detectLoginWall()) return 'login_required';
+    const failure = detectCollectionFailure(ctx);
+    if (failure) return failure;
 
     if (hadPayload || hasArticles()) return null;
 
     if (detectNoResults()) return 'no_results';
-    if (detectPageError()) {
-      errorSeen += 1;
-      if (errorSeen === 1 && clickRetry()) {
-        await sleep(2500);
-        continue;
-      }
-      return 'page_error';
-    }
 
+    if (document.visibilityState === 'hidden') {
+      // No gastar el plazo mientras la pestaña está en segundo plano.
+      deadline += 900;
+    }
     await sleep(800);
   }
   return 'no_results';
@@ -394,17 +431,34 @@ async function waitForInitialState(ctx: ContentContext): Promise<string | null> 
 async function runScraper(ctx: ContentContext): Promise<void> {
   if (scraping) return;
   scraping = true;
-  stopRequested = false;
-  limitReached = false;
   windowSeen.clear();
   queuedPosts = [];
   currentWindowCaptured = 0;
   oldestSeenMs = null;
   hadPayload = false;
-  pageHasResults = false;
   scrolls = 0;
   domFallbackUsed = false;
   lastProgressAt = 0;
+  frontierDates = [];
+  frontierIds.clear();
+  boundaryStreak = 0;
+
+  humanProfile = humanizeProfile(ctx.humanizeLevel);
+  const boundary = planBoundary(humanProfile);
+  boundaryMarginMs = boundary.marginMs;
+  boundaryRequiredStreak = boundary.requiredStreak;
+  blankClickBudget =
+    ctx.blankClicks && !ctx.manualScroll ? humanProfile.blankClickBudget : 0;
+  blankClicksDone = 0;
+  nextBlankClickAt = Date.now() + nextBlankClickDelay(humanProfile);
+  lastPointerAt = 0;
+  lastPointer = null;
+  lastUserInputAt = 0;
+
+  if (pendingTweets.length > 0 && matchesWindowUrl(location.href, ctx.expectedUrl)) {
+    processIncomingPosts(pendingTweets, false);
+  }
+  pendingTweets = [];
 
   const initialReason = await waitForInitialState(ctx);
   if (initialReason) {
@@ -412,14 +466,14 @@ async function runScraper(ctx: ContentContext): Promise<void> {
     return;
   }
 
+  const listPass = ctx.strategy === 'list';
   const startMs = Date.parse(ctx.windowStart);
+  const targetMs = listPass ? Date.parse(ctx.range.start) : startMs;
   let idleScrolls = 0;
   let lastCaptured = windowSeen.size;
-  let lastHeight = 0;
-  let showMoreClicks = 0;
-  const loopStartedAt = Date.now();
+  let lastHeight = document.documentElement.scrollHeight;
+  let lastScrollTop = window.scrollY;
   let lastDomScan = 0;
-  let pageErrorCount = 0;
 
   try {
     while (true) {
@@ -433,14 +487,33 @@ async function runScraper(ctx: ContentContext): Promise<void> {
         await finish('cancelled', 'Recolección detenida por el usuario.');
         return;
       }
+      const pageFailure = detectCollectionFailure(ctx);
+      if (pageFailure) {
+        await finish(pageFailure, initialReasonMessage(pageFailure));
+        return;
+      }
       if (limitReached) {
         await finish('max_posts', 'Se alcanzó el máximo de posts configurado.');
         return;
       }
 
-      if (paused) {
-        sendProgress('scrolling', 'Recolección pausada.', true);
+      if (paused || document.visibilityState === 'hidden') {
+        lastScrollTop = window.scrollY;
+        idleScrolls = 0;
+        await sendProgress(
+          'scrolling',
+          paused
+            ? 'Recolección pausada.'
+            : 'La pestaña está en segundo plano; esperando a que vuelva a ser visible.',
+        );
         await sleep(900);
+        continue;
+      }
+
+      // No competir con el usuario si acaba de interactuar con la página.
+      if (!ctx.manualScroll && Date.now() - lastUserInputAt < USER_GRACE_MS) {
+        await sendProgress('scrolling', 'Detecté actividad tuya en la pestaña; espero un momento.');
+        await sleep(700);
         continue;
       }
 
@@ -449,33 +522,32 @@ async function runScraper(ctx: ContentContext): Promise<void> {
         return;
       }
 
-      if (oldestSeenMs !== null && oldestSeenMs < startMs && scrolls >= 3) {
-        await finish('date_boundary', 'Se cruzó la fecha de inicio del rango.');
-        return;
-      }
-
-      if (detectRateLimit()) {
-        await finish('rate_limited', 'X limitó temporalmente la carga de resultados.');
-        return;
-      }
-
-      if (detectLoginWall()) {
-        await finish('login_required', 'X solicita iniciar sesión.');
-        return;
-      }
-
-      if (detectPageError()) {
-        pageErrorCount += 1;
-        if (pageErrorCount === 1 && clickRetry()) {
-          await sleep(2500);
-          continue;
+      const frontier = currentFrontierMs();
+      if (listPass) {
+        if (
+          frontier !== null &&
+          scrolls >= 2 &&
+          listPassReachedStart(frontier, targetMs, boundaryMarginMs)
+        ) {
+          boundaryStreak += 1;
+          if (boundaryStreak >= boundaryRequiredStreak) {
+            await finish(
+              'date_boundary',
+              `Se alcanzó la fecha de inicio del rango (${shortDate(new Date(frontier).toISOString())}).`,
+            );
+            return;
+          }
+        } else {
+          boundaryStreak = 0;
         }
-        if (pageErrorCount >= 2) {
-          await finish('page_error', 'X devolvió un error al cargar más resultados.');
+      } else if (frontier !== null && frontier <= targetMs && scrolls >= 3) {
+        boundaryStreak += 1;
+        if (boundaryStreak >= 2) {
+          await finish('date_boundary', 'Se cruzó la fecha de inicio de la ventana.');
           return;
         }
       } else {
-        pageErrorCount = 0;
+        boundaryStreak = 0;
       }
 
       if (scrolls >= ctx.maxScrolls) {
@@ -488,7 +560,7 @@ async function runScraper(ctx: ContentContext): Promise<void> {
         return;
       }
 
-      if (!hadPayload && Date.now() - loopStartedAt > 5000 && Date.now() - lastDomScan > 3500) {
+      if (!hadPayload && Date.now() - lastDomScan > 3500) {
         const domPosts = scrapeDomPosts();
         lastDomScan = Date.now();
         if (domPosts.length > 0) {
@@ -500,37 +572,312 @@ async function runScraper(ctx: ContentContext): Promise<void> {
         }
       }
 
-      if (clickShowMore() && showMoreClicks < 30) {
-        showMoreClicks += 1;
-        await sleep(1200);
+      const delay = ctx.manualScroll
+        ? 1500
+        : humanizedDelay(ctx.minDelayMs, ctx.maxDelayMs, humanProfile);
+      if (!ctx.manualScroll) {
+        performAutomaticScroll();
+        scrolls += 1;
       }
-
-      const heightBefore = document.documentElement.scrollHeight;
-      scrollToBottom();
-      scrolls += 1;
-      const delay = randomBetween(ctx.minDelayMs, ctx.maxDelayMs);
-      await sleep(delay);
+      await interruptibleSleep(delay);
       await flushQueue();
 
       const heightAfter = document.documentElement.scrollHeight;
       const capturedNow = windowSeen.size;
-      if (capturedNow !== lastCaptured || heightAfter !== lastHeight || heightAfter !== heightBefore) {
+      const scrollTop = window.scrollY;
+      const atBottom = scrollTop + window.innerHeight >= heightAfter - 160;
+      const waitingForScroll =
+        ctx.manualScroll &&
+        (document.hidden || scrollTop + window.innerHeight < heightAfter - 32);
+      const moved = ctx.manualScroll && scrollTop !== lastScrollTop;
+      if (moved && scrollTop > lastScrollTop) scrolls += 1;
+      if (
+        paused ||
+        waitingForScroll ||
+        moved ||
+        capturedNow !== lastCaptured ||
+        heightAfter !== lastHeight
+      ) {
         idleScrolls = 0;
-      } else {
+      } else if (atBottom) {
         idleScrolls += 1;
+      } else {
+        // Seguir bajando no es «no hay más posts»: aún queda timeline por recorrer.
+        idleScrolls = Math.max(0, idleScrolls - 1);
       }
       lastCaptured = capturedNow;
       lastHeight = heightAfter;
+      lastScrollTop = scrollTop;
 
-      sendProgress(
-        'scrolling',
-        `Ventana ${ctx.windowIndex + 1}: ${currentWindowCaptured} posts válidos · ${scrolls} desplazamientos.`,
-      );
+      await maybeHumanBehavior();
+      await sendProgress('scrolling', progressMessage(listPass, ctx));
     }
   } catch (error) {
     console.error('[Xense] Error durante la recolección:', error);
     await finish('page_error', `Error inesperado: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+function progressMessage(listPass: boolean, ctx: ContentContext): string {
+  if (listPass) {
+    return `Recorriendo la lista: ${currentWindowCaptured} posts · ${scrolls} pasos · visto hasta ${shortDate(frontierIso())}.`;
+  }
+  return ctx.manualScroll
+    ? `Ventana ${ctx.windowIndex + 1}: ${currentWindowCaptured} posts. Desplázate en X para cargar más.`
+    : `Ventana ${ctx.windowIndex + 1}: ${currentWindowCaptured} posts válidos · ${scrolls} desplazamientos.`;
+}
+
+function performAutomaticScroll(): void {
+  const height = document.documentElement.scrollHeight;
+  if (!humanProfile.enabled) {
+    window.scrollTo(0, height);
+    return;
+  }
+  const viewport = window.innerHeight || 700;
+  const maxTop = Math.max(0, height - viewport);
+  const remaining = maxTop - window.scrollY;
+  if (remaining <= 2) {
+    window.scrollTo(0, maxTop);
+    return;
+  }
+  const step = planScrollStep(viewport, remaining, humanProfile);
+  window.scrollTo(0, Math.min(maxTop, window.scrollY + step));
+}
+
+/** Espera que respeta pausa, pestaña oculta y cancelación. */
+async function interruptibleSleep(ms: number): Promise<void> {
+  let deadline = Date.now() + Math.max(0, ms);
+  while (Date.now() < deadline) {
+    if (stopRequested || extensionInvalidated) return;
+    if (paused || document.visibilityState === 'hidden') {
+      // El tiempo en pausa no consume la espera configurada.
+      deadline += Math.min(500, Math.max(0, deadline - Date.now()));
+      await sleep(250);
+      continue;
+    }
+    await sleep(Math.min(250, Math.max(1, deadline - Date.now())));
+  }
+}
+
+async function maybeHumanBehavior(): Promise<void> {
+  if (!humanProfile.enabled || !context || context.manualScroll) return;
+  if (paused || stopRequested || document.visibilityState === 'hidden') return;
+
+  const pause = planReadingPause(humanProfile);
+  if (pause > 0) await interruptibleSleep(pause);
+  if (paused || stopRequested) return;
+
+  const now = Date.now();
+  if (now - lastPointerAt >= 10_000 && Math.random() < humanProfile.pointerMoveChance) {
+    await movePointerRandomly();
+    lastPointerAt = Date.now();
+  }
+
+  if (blankClicksDone < blankClickBudget && Date.now() >= nextBlankClickAt) {
+    if (tryBlankClick()) blankClicksDone += 1;
+    nextBlankClickAt = Date.now() + nextBlankClickDelay(humanProfile);
+  }
+}
+
+const UNSAFE_SELECTOR = [
+  'a',
+  'button',
+  'input',
+  'textarea',
+  'select',
+  'label',
+  'summary',
+  'video',
+  'audio',
+  'article',
+  'header',
+  'nav',
+  '[role="button"]',
+  '[role="link"]',
+  '[role="tab"]',
+  '[role="menuitem"]',
+  '[role="checkbox"]',
+  '[role="switch"]',
+  '[role="dialog"]',
+  '[role="alertdialog"]',
+  '[contenteditable="true"]',
+  '[data-testid="tweet"]',
+  '[data-testid="cellInnerDiv"]',
+].join(',');
+
+function isUnsafeElement(element: Element | null): boolean {
+  return !element || Boolean(element.closest(UNSAFE_SELECTOR));
+}
+
+function hasUnsafeStyle(element: Element): boolean {
+  let current: Element | null = element;
+  while (current && current !== document.body) {
+    const style = window.getComputedStyle?.(current);
+    if (
+      style &&
+      (style.cursor === 'pointer' || style.position === 'fixed' || style.position === 'sticky')
+    ) {
+      return true;
+    }
+    current = current.parentElement;
+  }
+  return false;
+}
+
+/**
+ * Busca un punto realmente inerte. Si hay cualquier duda, devuelve null.
+ * El clic se dispara sobre <body>, nunca sobre el elemento validado.
+ */
+function findBlankPoint(): Point | null {
+  const width = window.innerWidth;
+  const height = window.innerHeight;
+  if (!width || !height) return null;
+  if (
+    document.querySelector(
+      '[role="dialog"], [aria-modal="true"], [role="menu"], [role="listbox"]',
+    )
+  ) {
+    return null;
+  }
+
+  try {
+    const selection = window.getSelection?.();
+    if (selection && String(selection).trim()) return null;
+  } catch {
+    return null;
+  }
+
+  const active = document.activeElement as HTMLElement | null;
+  if (
+    active &&
+    (active.tagName === 'INPUT' ||
+      active.tagName === 'TEXTAREA' ||
+      active.tagName === 'SELECT' ||
+      active.isContentEditable)
+  ) {
+    return null;
+  }
+
+  const points: Point[] = [
+    {
+      x: width - randomBetween(12, 40),
+      y: randomBetween(Math.round(height * 0.2), Math.round(height * 0.85)),
+    },
+    {
+      x: randomBetween(12, 40),
+      y: randomBetween(Math.round(height * 0.2), Math.round(height * 0.85)),
+    },
+    {
+      x: randomBetween(Math.round(width * 0.3), Math.round(width * 0.7)),
+      y: height - randomBetween(10, 36),
+    },
+  ];
+
+  for (const point of points) {
+    if (point.x <= 0 || point.y <= 0 || point.x >= width || point.y >= height) continue;
+    const element = document.elementFromPoint?.(point.x, point.y) as Element | null;
+    if (!element) continue;
+    const stack: Element[] =
+      (document.elementsFromPoint?.(point.x, point.y) as Element[] | undefined) ?? [element];
+    if (stack.some((item) => isUnsafeElement(item))) continue;
+    if (isUnsafeElement(element) || hasUnsafeStyle(element)) continue;
+    return point;
+  }
+  return null;
+}
+
+function dispatchPointerEvent(
+  target: Element,
+  type: string,
+  point: Point,
+  buttons: number,
+): void {
+  if (typeof PointerEvent === 'undefined') return;
+  try {
+    target.dispatchEvent(
+      new PointerEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: window,
+        clientX: point.x,
+        clientY: point.y,
+        button: 0,
+        buttons,
+        pointerId: 1,
+        pointerType: 'mouse',
+        isPrimary: true,
+      }),
+    );
+  } catch {
+    // Algunos navegadores no permiten construir PointerEvent sintéticos.
+  }
+}
+
+function dispatchMouseEvent(
+  target: Element,
+  type: string,
+  point: Point,
+  buttons: number,
+): void {
+  if (typeof MouseEvent === 'undefined') return;
+  try {
+    target.dispatchEvent(
+      new MouseEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: window,
+        clientX: point.x,
+        clientY: point.y,
+        button: 0,
+        buttons,
+      }),
+    );
+  } catch {
+    // Nunca interrumpir la recolección por un evento sintético.
+  }
+}
+
+async function movePointerRandomly(): Promise<void> {
+  if (typeof MouseEvent === 'undefined' && typeof PointerEvent === 'undefined') return;
+  const width = window.innerWidth;
+  const height = window.innerHeight;
+  if (!width || !height) return;
+
+  const target: Point = {
+    x: randomBetween(40, Math.max(41, width - 40)),
+    y: randomBetween(80, Math.max(81, height - 80)),
+  };
+  const from = lastPointer ?? { x: Math.round(width * 0.7), y: Math.round(height * 0.5) };
+  const path = planPointerPath(from, target);
+  const surface = document.body ?? document.documentElement;
+  if (!surface) return;
+
+  for (const point of path) {
+    if (stopRequested || paused) return;
+    dispatchPointerEvent(surface, 'pointermove', point, 0);
+    dispatchMouseEvent(surface, 'mousemove', point, 0);
+    await sleep(randomBetween(35, 120));
+  }
+  lastPointer = target;
+}
+
+function tryBlankClick(): boolean {
+  const point = findBlankPoint();
+  if (!point) return false;
+  const surface = document.body;
+  if (!surface) return false;
+
+  dispatchPointerEvent(surface, 'pointermove', point, 0);
+  dispatchMouseEvent(surface, 'mousemove', point, 0);
+  dispatchPointerEvent(surface, 'pointerdown', point, 1);
+  dispatchMouseEvent(surface, 'mousedown', point, 1);
+  dispatchPointerEvent(surface, 'pointerup', point, 0);
+  dispatchMouseEvent(surface, 'mouseup', point, 0);
+  dispatchMouseEvent(surface, 'click', point, 0);
+  lastPointer = point;
+  return true;
 }
 
 function initialReasonMessage(reason: string): string {
@@ -543,6 +890,8 @@ function initialReasonMessage(reason: string): string {
       return 'No se encontraron posts para esta ventana.';
     case 'page_error':
       return 'X devolvió un error al cargar los resultados.';
+    case 'navigation_changed':
+      return 'La recolección se detuvo al salir de la búsqueda o la lista.';
     default:
       return 'La recolección se detuvo.';
   }
@@ -550,27 +899,53 @@ function initialReasonMessage(reason: string): string {
 
 async function finish(reason: string, message: string): Promise<void> {
   if (!context) return;
+  const ctx = context;
+  scraping = false;
   await flushQueue();
-  sendProgress('scrolling', message, true);
-  const failureReasons = new Set(['login_required', 'rate_limited', 'page_error']);
-  if (failureReasons.has(reason)) {
+
+  const frontier = currentFrontierMs();
+  const seenIso = frontier !== null ? new Date(frontier).toISOString() : null;
+
+  if (ctx.strategy === 'list') {
+    const reachedStart =
+      reason === 'date_boundary' ||
+      listPassReachedStart(frontier, Date.parse(ctx.range.start), boundaryMarginMs);
     await sendBg({
-      type: 'WINDOW_FAILED',
-      windowIndex: context.windowIndex,
+      type: 'LIST_PASS_DONE',
       reason,
       message,
+      scrolls,
+      captured: currentWindowCaptured,
+      oldestSeenAt: seenIso,
+      coveredUntilAt: seenIso,
+      reachedStart,
     });
   } else {
-    await sendBg({
-      type: 'WINDOW_DONE',
-      windowIndex: context.windowIndex,
-      reason,
-      scrolls,
-      windowCaptured: currentWindowCaptured,
-      oldestSeenAt: oldestSeenMs !== null ? new Date(oldestSeenMs).toISOString() : null,
-    });
+    const failureReasons = new Set([
+      'login_required',
+      'rate_limited',
+      'page_error',
+      'navigation_changed',
+    ]);
+    if (failureReasons.has(reason)) {
+      await sendBg({
+        type: 'WINDOW_FAILED',
+        windowIndex: ctx.windowIndex,
+        reason,
+        message,
+      });
+    } else {
+      await sendBg({
+        type: 'WINDOW_DONE',
+        windowIndex: ctx.windowIndex,
+        reason,
+        scrolls,
+        windowCaptured: currentWindowCaptured,
+        oldestSeenAt: seenIso,
+      });
+    }
   }
-  scraping = false;
+  context = null;
 }
 
 function parseCompactNumber(value: string): number {
@@ -734,24 +1109,14 @@ async function upsertLists(lists: ListInfo[]): Promise<void> {
   await sendBg({ type: 'UPSERT_LISTS', lists: valid });
 }
 
-async function discoverListsIfNeeded(): Promise<void> {
-  if (context || listDiscoveryStarted || !isListsIndexPage()) return;
-  listDiscoveryStarted = true;
-
-  for (let iteration = 0; iteration < 12; iteration += 1) {
-    const lists = scrapeListsFromDom();
-    if (lists.length > 0) {
-      const signature = lists.map((list) => `${list.id}:${list.name}`).join('|');
-      if (signature !== lastListsSignature) {
-        lastListsSignature = signature;
-        await upsertLists(lists);
-      }
-    }
-    if (iteration < 11) {
-      scrollToBottom();
-      await sleep(1600);
-    }
-  }
+async function discoverVisibleLists(): Promise<void> {
+  if (extensionInvalidated || document.hidden || !isListsIndexPage()) return;
+  const lists = scrapeListsFromDom();
+  if (lists.length === 0) return;
+  const signature = lists.map((list) => `${list.id}:${list.name}`).join('|');
+  if (signature === lastListsSignature) return;
+  lastListsSignature = signature;
+  await upsertLists(lists);
 }
 
 async function reportListPageInfo(): Promise<void> {
@@ -759,7 +1124,9 @@ async function reportListPageInfo(): Promise<void> {
   const id = location.pathname.match(/\/i\/lists\/(\d+)/)?.[1];
   if (!id) return;
 
+  const pathname = location.pathname;
   for (let attempt = 0; attempt < 8; attempt += 1) {
+    if (location.pathname !== pathname) return;
     const headers = Array.from(
       document.querySelectorAll<HTMLElement>(
         '[data-testid="primaryColumn"] h2[role="heading"], main h2[role="heading"]',

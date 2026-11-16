@@ -73,6 +73,8 @@ function makeRun(overrides: Partial<RunRecord> = {}): RunRecord {
       maxDelayMs: 4200,
       idleScrolls: 8,
       maxScrolls: 150,
+      humanizeLevel: 'off',
+      blankClicks: false,
     },
     windows: [makeWindow(0, START, MID), makeWindow(1, MID, END)],
     currentWindowIndex: 1,
@@ -137,6 +139,7 @@ describe('cobertura de ventanas', () => {
     expect(isWindowCovered(makeWindow(0, START, MID, 'done', 'exhausted'))).toBe(true);
     expect(isWindowCovered(makeWindow(0, START, MID, 'done', 'no_results'))).toBe(true);
     expect(isWindowCovered(makeWindow(0, START, MID, 'done', 'date_boundary'))).toBe(true);
+    expect(isWindowCovered(makeWindow(0, START, MID, 'done', 'list_pass'))).toBe(true);
   });
 
   it('considera incompletos los límites, la cancelación y las ventanas omitidas', () => {
@@ -144,6 +147,9 @@ describe('cobertura de ventanas', () => {
     expect(isWindowCovered(makeWindow(0, START, MID, 'done', 'max_posts'))).toBe(false);
     expect(isWindowCovered(makeWindow(0, START, MID, 'done', 'cancelled'))).toBe(false);
     expect(isWindowCovered(makeWindow(0, START, MID, 'done', 'skipped_limit'))).toBe(false);
+    expect(isWindowCovered(makeWindow(0, START, MID, 'done', 'list_incomplete'))).toBe(false);
+    expect(isWindowCovered(makeWindow(0, START, MID, 'done', 'list_failed'))).toBe(false);
+    expect(isWindowCovered(makeWindow(0, START, MID, 'done', 'stalled'))).toBe(false);
     expect(isWindowCovered(makeWindow(0, START, MID, 'failed', 'rate_limited'))).toBe(false);
     expect(isWindowCovered(makeWindow(0, START, MID, 'active'))).toBe(false);
   });
